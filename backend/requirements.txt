@@ -1,0 +1,10 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+yt-dlp>=2026.7.4
+# PO-token provider plugin (talks to a bgutil provider for full-speed formats).
+# Harmless when no provider is configured — yt-dlp just ignores it.
+bgutil-ytdlp-pot-provider>=1.1.0
+# resolves X/Twitter PHOTO posts (yt-dlp is video-only there). Used in
+# URL-resolution mode (-j) — it never downloads; YoinkT range-proxies the CDN URLs.
+gallery-dl>=1.29
+

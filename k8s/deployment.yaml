@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: YoinkT
+  labels: { app: YoinkT }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: YoinkT }
+  template:
+    metadata:
+      labels: { app: YoinkT }
+    spec:
+      containers:
+        - name: YoinkT
+          image: YoinkT:latest   # push to your registry, update tag
+          ports:
+            - containerPort: 8000
+          env:
+            - name: MAX_CONCURRENCY
+              value: "4"
+            # Datacenter IPs get bot-blocked by YouTube. Enable ONE of these:
+            # - name: PROXY_URL
+            #   valueFrom:
+            #     secretKeyRef: { name: YoinkT-secrets, key: proxy-url }
+            # - name: COOKIES_FILE
+            #   value: /secrets/cookies.txt
+          volumeMounts:
+            # named pipes for the merge path live in /tmp; rootfs is read-only.
+            # RAM-backed, tiny (pipes hold no media), keeps pods stateless.
+            - name: tmp
+              mountPath: /tmp
+          #   - name: cookies
+          #     mountPath: /secrets
+          #     readOnly: true
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: "1", memory: 512Mi }
+          livenessProbe:
+            httpGet: { path: /api/health, port: 8000 }
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            httpGet: { path: /api/health, port: 8000 }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+      volumes:
+        - name: tmp
+          emptyDir: { medium: Memory, sizeLimit: 16Mi }
+      #   - name: cookies
+      #     secret: { secretName: YoinkT-cookies }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: YoinkT
+spec:
+  selector: { app: YoinkT }
+  ports:
+    - port: 80
+      targetPort: 8000

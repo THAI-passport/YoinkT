@@ -1,0 +1,1105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>YoinkT</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='9' fill='%23993C1D'/%3E%3Cpath d='M15 11l12 7-12 7z' fill='%23FAECE7' transform='rotate(-12 20 18)'/%3E%3Cpath d='M9 27h6M8 31h9' stroke='%23F0997B' stroke-width='2.5' stroke-linecap='round'/%3E%3C/svg%3E">
+<style>
+  :root{
+    --bg:#15100c; --panel:#1e1712; --raise:#2a1e15; --border:#3b2b1f;
+    --text:#f2ece5; --muted:#a89a8d; --dim:#6e6156;
+    --accent:#d85a30; --accent-hi:#f07a55; --ok:#5cb573; --err:#e07862;
+    --shade:rgba(12,8,5,.93);
+  }
+  [data-theme=light]{
+    --bg:#faf5f0; --panel:#ffffff; --raise:#f4ebe3; --border:#e3d4c6;
+    --text:#2c1e13; --muted:#7d6c5d; --dim:#a99a8b;
+    --shade:rgba(250,245,240,.94);
+  }
+  *{box-sizing:border-box;margin:0}
+  html{color-scheme:dark}
+  [data-theme=light] html{color-scheme:light}
+  body{background:var(--bg);color:var(--text);min-height:100vh;
+    font:15px/1.55 ui-sans-serif,-apple-system,"Segoe UI",system-ui,sans-serif;
+    transition:background .3s,color .3s}
+  #bg{position:fixed;inset:-40px;z-index:-1;background-size:cover;background-position:center;
+    filter:blur(48px) brightness(.32) saturate(1.2);opacity:0;transition:opacity .6s}
+  [data-theme=light] #bg{filter:blur(48px) brightness(1.4) saturate(.6);}
+  .wrap{max-width:820px;margin:0 auto;padding:26px 20px 32px}
+
+  header{display:flex;align-items:center;gap:12px;margin-bottom:26px}
+  header svg{border-radius:9px;flex:none}
+  .word{font-size:24px;font-weight:800;letter-spacing:-.5px}
+  .word em{color:var(--accent);font-style:normal}
+  header small{color:var(--muted)}
+  #theme{margin-left:auto;background:none;border:1px solid var(--border);color:var(--muted);
+    border-radius:8px;width:36px;height:36px;font-size:16px;cursor:pointer}
+  #theme:hover{color:var(--text);border-color:var(--accent)}
+
+  /* hero (idle) */
+  body.idle .wrap{padding-top:0}
+  body.idle header{opacity:0;pointer-events:none;height:0;margin:0;overflow:hidden}
+  #hero{display:none}
+  body.idle #hero{display:flex;flex-direction:column;align-items:center;gap:14px;
+    padding:15vh 0 34px;text-align:center}
+  #hero .word{font-size:40px}
+  #hero p{color:var(--muted)}
+  body.idle #themeIdle{position:fixed;top:16px;right:16px}
+  #themeIdle{display:none;background:none;border:1px solid var(--border);color:var(--muted);
+    border-radius:8px;width:36px;height:36px;font-size:16px;cursor:pointer}
+  body.idle #themeIdle{display:block}
+
+  .bar{display:flex;gap:10px}
+  input[type=url]{flex:1;background:var(--panel);border:1px solid var(--border);color:var(--text);
+    padding:15px 17px;border-radius:12px;font-size:15px;outline:none;transition:border-color .15s,box-shadow .15s}
+  input[type=url]::placeholder{color:var(--dim)}
+  input[type=url]:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(216,90,48,.18)}
+  .btn{background:var(--accent);color:#fff;border:0;padding:15px 28px;border-radius:12px;
+    font-size:15px;font-weight:800;cursor:pointer;transition:background .15s,transform .08s}
+  .btn:hover{background:var(--accent-hi)}
+  .btn:active{transform:scale(.95)}
+  .btn:disabled{opacity:.5;cursor:progress}
+  .hint{margin-top:10px;color:var(--dim);font-size:13px;text-align:center}
+
+  #recents{display:flex;gap:8px;margin-top:14px;justify-content:center;flex-wrap:wrap}
+  .rec{width:74px;flex:none;cursor:pointer;border:1px solid var(--border);border-radius:8px;
+    overflow:hidden;background:var(--panel);transition:border-color .15s,transform .08s}
+  .rec:hover{border-color:var(--accent)}
+  .rec:active{transform:scale(.95)}
+  .rec img{width:100%;height:42px;object-fit:cover;display:block}
+  .rec div{font-size:9.5px;color:var(--muted);padding:3px 5px;white-space:nowrap;
+    overflow:hidden;text-overflow:ellipsis}
+
+  .err{margin-top:16px;color:var(--err);background:rgba(224,120,98,.09);
+    border:1px solid rgba(224,120,98,.35);border-radius:12px;padding:12px 16px;
+    display:none;white-space:pre-wrap;font-size:14px}
+
+  .skel{display:none;margin-top:24px;border-radius:16px;overflow:hidden;border:1px solid var(--border)}
+  .skel div{height:230px;background:linear-gradient(100deg,var(--panel) 40%,var(--raise) 50%,var(--panel) 60%);
+    background-size:200% 100%;animation:sh 1.2s infinite linear}
+  @keyframes sh{to{background-position:-200% 0}}
+
+  .card{display:none;margin-top:24px;background:var(--shade);backdrop-filter:blur(6px);
+    border:1px solid var(--border);border-radius:16px;overflow:hidden;animation:pop .3s ease}
+  @keyframes pop{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+  .hero-img{position:relative;aspect-ratio:16/7;overflow:hidden;background:#000}
+  .hero-img img{width:100%;height:100%;object-fit:cover;display:block}
+  .hero-img .fade{position:absolute;inset:0;background:linear-gradient(180deg,transparent 30%,var(--shade))}
+  .hero-img .meta{position:absolute;left:20px;right:20px;bottom:12px}
+  .hero-img h2{font-size:19px;line-height:1.3;color:#fff;text-shadow:0 1px 8px rgba(0,0,0,.8)}
+  .hero-img p{color:#d8cfc6;font-size:13.5px;margin-top:2px;text-shadow:0 1px 6px rgba(0,0,0,.8)}
+  .dur{position:absolute;top:12px;right:12px;background:rgba(0,0,0,.72);color:#fff;
+    border-radius:6px;padding:3px 9px;font:600 12.5px ui-monospace,monospace}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px;padding:16px}
+  .fmt{display:flex;align-items:center;justify-content:space-between;gap:8px;text-align:left;
+    background:var(--raise);border:1px solid var(--border);border-radius:12px;width:100%;
+    padding:12px 14px;cursor:pointer;color:var(--text);font:inherit;
+    transition:border-color .15s,background .15s,transform .08s}
+  .fmt:hover{border-color:var(--accent)}
+  .fmt:active{transform:scale(.98)}
+  .fmt .q{font-size:17px;font-weight:800}
+  .fmt .q small{color:var(--muted);font-weight:600;font-size:12px;margin-left:5px}
+  .fmt .m{text-align:right;font-size:12px;color:var(--muted);line-height:1.45}
+  .fmt .m b{color:var(--text);font-weight:600}
+  .fmt.big{grid-column:1/-1;border-color:var(--accent);background:linear-gradient(120deg,var(--raise),rgba(216,90,48,.12));padding:16px 18px}
+  .fmt .mthumb{width:56px;height:56px;object-fit:cover;border-radius:8px;flex:none;background:var(--panel)}
+  .fmt.big .q{font-size:24px}
+  .fmt.busy{border-color:var(--accent);cursor:progress}
+  .fmt.done{border-color:var(--ok)}
+  .fmt.done .q::after{content:" ✓";color:var(--ok)}
+  .prog{height:4px;background:var(--border);border-radius:2px;overflow:hidden;margin-top:6px;display:none}
+  .prog i{display:block;height:100%;width:0;background:var(--accent);transition:width .2s}
+  .fmt.busy .prog{display:block}
+  .badge{display:inline-block;border-radius:4px;padding:1px 6px;font-size:10.5px;font-weight:700;
+    letter-spacing:.4px;text-transform:uppercase}
+  .badge.p{background:rgba(92,181,115,.15);color:var(--ok)}
+  .badge.m{background:rgba(216,90,48,.16);color:var(--accent-hi)}
+  .badge.a{background:rgba(92,141,181,.18);color:#7fb3dd}
+  .dlctl{display:inline-block;cursor:pointer;padding:0 6px;border-radius:5px;background:var(--panel);
+    border:1px solid var(--border);margin-right:4px;font-size:12px;line-height:20px;vertical-align:middle}
+  .dlctl:hover{border-color:var(--accent);color:var(--accent-hi)}
+  .plbtn{background:var(--raise);border:1px solid var(--border);color:var(--text);border-radius:7px;
+    padding:5px 12px;font-size:12.5px;cursor:pointer}
+  .plbtn:hover{border-color:var(--accent)}
+
+  .tools{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:14px 16px 0}
+  .tools label{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted);cursor:pointer}
+  .tools input[type=text]{width:76px;background:var(--panel);border:1px solid var(--border);
+    color:var(--text);border-radius:8px;padding:7px 9px;font:600 13px ui-monospace,monospace;outline:none}
+  .tools input[type=text]:focus{border-color:var(--accent)}
+  .tools input[type=text]:disabled{opacity:.4}
+  .chip{background:var(--raise);border:1px solid var(--border);color:var(--muted);border-radius:99px;
+    padding:5px 12px;font-size:12.5px;cursor:pointer;transition:border-color .15s,color .15s}
+  .chip:hover{border-color:var(--accent);color:var(--text)}
+  .chip.auto{opacity:.75}
+  .chips{display:flex;flex-wrap:wrap;gap:7px;padding:10px 16px 2px}
+  .chips b{font-size:12px;color:var(--dim);align-self:center;font-weight:600}
+  .plhint{margin:12px 16px 0;font-size:13px}
+  .plhint button{background:none;border:0;color:var(--accent-hi);cursor:pointer;font:inherit;text-decoration:underline;padding:0}
+
+  .plhead{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:16px}
+  .plhead h2{font-size:17px;flex:1;min-width:180px}
+  .plhead select{background:var(--raise);border:1px solid var(--border);color:var(--text);
+    border-radius:8px;padding:8px 10px;font:inherit;font-size:13.5px}
+  .plrow{display:flex;align-items:center;gap:10px;padding:9px 16px;border-top:1px solid var(--border);font-size:13.5px}
+  .plrow img{width:64px;height:36px;object-fit:cover;border-radius:6px;flex:none;background:var(--raise)}
+  .plrow .t{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .plrow .st{flex:none;font:600 12px ui-monospace,monospace;color:var(--muted);min-width:74px;text-align:right}
+  .plrow.done .st{color:var(--ok)}
+  .plrow.err .st{color:var(--err)}
+  .plrow.run .st{color:var(--accent-hi)}
+  .plrow.na{opacity:.5}
+  .plrow.na .st{color:var(--dim)}
+  footer{margin-top:34px;color:var(--dim);font-size:13px;display:flex;justify-content:space-between;gap:12px}
+  #ver{font:600 12px ui-monospace,monospace}
+
+  /* live site icon inside the url box */
+  .bar{position:relative}
+  #siteicon{position:absolute;left:14px;top:50%;transform:translateY(-50%);width:24px;height:24px;
+    display:none;align-items:center;justify-content:center;font-weight:800;font-size:15px;
+    border-radius:6px;color:#fff;pointer-events:none;z-index:2}
+  .bar.detected input[type=url]{padding-left:48px}
+
+  /* toasts */
+  #toasts{position:fixed;right:16px;bottom:16px;z-index:60;display:flex;flex-direction:column;gap:8px;max-width:340px}
+  .toast{background:var(--raise);border:1px solid var(--border);border-left:3px solid var(--accent);
+    border-radius:10px;padding:10px 13px;font-size:13.5px;color:var(--text);box-shadow:0 6px 24px rgba(0,0,0,.35);
+    animation:tin .22s ease;display:flex;gap:9px;align-items:flex-start}
+  .toast.ok{border-left-color:var(--ok)} .toast.err{border-left-color:var(--err)}
+  .toast .x{margin-left:auto;cursor:pointer;color:var(--dim);flex:none}
+  @keyframes tin{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:none}}
+
+  /* gallery media picker */
+  .gal{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px;padding:4px 16px 6px}
+  .gitem{position:relative;border:2px solid var(--border);border-radius:12px;overflow:hidden;cursor:pointer;
+    background:var(--raise);aspect-ratio:1;transition:border-color .15s,transform .08s}
+  .gitem:hover{border-color:var(--accent)} .gitem:active{transform:scale(.97)}
+  .gitem.sel{border-color:var(--accent)}
+  .gitem img{width:100%;height:100%;object-fit:cover;display:block}
+  .gitem .tag{position:absolute;left:6px;top:6px;background:rgba(0,0,0,.72);color:#fff;border-radius:5px;
+    padding:1px 6px;font-size:10.5px;font-weight:700}
+  .gitem .ck{position:absolute;right:6px;top:6px;width:22px;height:22px;border-radius:6px;background:rgba(0,0,0,.6);
+    border:1.5px solid #fff;display:flex;align-items:center;justify-content:center;color:#fff;font-size:14px}
+  .gitem.sel .ck{background:var(--accent);border-color:var(--accent)}
+  .gitem .play{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    font-size:30px;color:#fff;text-shadow:0 2px 8px rgba(0,0,0,.7);pointer-events:none}
+  .gitem .st{position:absolute;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);color:#fff;font-size:10.5px;
+    text-align:center;padding:2px}
+  .galbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px 16px 2px}
+  .galbar .plbtn.pri{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:700}
+
+  /* lightbox */
+  #lb{position:fixed;inset:0;z-index:70;background:rgba(0,0,0,.9);display:none;align-items:center;justify-content:center;padding:24px}
+  #lb.on{display:flex} #lb img{max-width:92vw;max-height:88vh;border-radius:10px}
+  #lb .cl{position:absolute;top:16px;right:20px;color:#fff;font-size:30px;cursor:pointer;line-height:1}
+
+  /* options drawer */
+  .optsum{list-style:none;cursor:pointer;padding:12px 16px 4px;color:var(--muted);font-size:13.5px;
+    display:flex;align-items:center;gap:6px;user-select:none}
+  .optsum::-webkit-details-marker{display:none}
+  .optsum .ar{transition:transform .18s} details[open] .optsum .ar{transform:rotate(90deg)}
+
+  @media (max-width:560px){.bar{flex-direction:column}.hero-img{aspect-ratio:16/9}
+    .grid{grid-template-columns:1fr 1fr}
+    .fmt{padding:14px 15px} .fmt .q{font-size:18px}
+    .btn{padding:16px 28px} input[type=url]{padding:16px 17px}
+    #siteicon{top:26px} .bar.detected input[type=url]{padding-left:48px}
+    .gal{grid-template-columns:repeat(auto-fill,minmax(96px,1fr))}
+    #toasts{left:12px;right:12px;max-width:none}}
+</style>
+</head>
+<body class="idle">
+<div id="bg"></div>
+<button id="themeIdle" title="Toggle theme">◐</button>
+<div class="wrap">
+  <div id="hero">
+    <svg width="72" height="72" viewBox="0 0 40 40"><rect width="40" height="40" rx="9" fill="#993C1D"/><path d="M15 11l12 7-12 7z" fill="#FAECE7" transform="rotate(-12 20 18)"/><path d="M9 27h6M8 31h9" stroke="#F0997B" stroke-width="2.5" stroke-linecap="round"/></svg>
+    <div class="word">Yoink<em>T</em></div>
+    <p>grab it and go — YouTube · X · Facebook · Instagram · TikTok</p>
+  </div>
+
+  <header>
+    <svg width="34" height="34" viewBox="0 0 40 40"><rect width="40" height="40" rx="9" fill="#993C1D"/><path d="M15 11l12 7-12 7z" fill="#FAECE7" transform="rotate(-12 20 18)"/><path d="M9 27h6M8 31h9" stroke="#F0997B" stroke-width="2.5" stroke-linecap="round"/></svg>
+    <span class="word">Yoink<em>T</em></span>
+    <small>grab it and go</small>
+    <button id="theme" title="Toggle theme">◐</button>
+  </header>
+
+  <form class="bar" id="f">
+    <span id="siteicon"></span>
+    <input type="url" id="url" placeholder="Paste a YouTube, X, Facebook, Instagram, or TikTok link..." required autofocus>
+    <button class="btn" id="go" type="submit">YoinkT</button>
+  </form>
+  <div class="hint">Paste a link from YouTube, X, Facebook, Instagram, or TikTok anywhere on this page — it fetches automatically.</div>
+  <div id="recents"></div>
+  <div class="err" id="err"></div>
+
+  <div class="skel" id="skel"><div></div></div>
+
+  <div class="card" id="card">
+    <div class="hero-img">
+      <img id="thumb" alt="">
+      <div class="fade"></div>
+      <div class="dur" id="dur"></div>
+      <div class="meta"><h2 id="title"></h2><p id="sub"></p></div>
+    </div>
+    <div class="plhint" id="plhint" style="display:none"></div>
+    <details id="optdrawer" style="display:none">
+      <summary class="optsum"><span class="ar">▶</span> <span>Options — clip, QuickTime, turbo, skip sponsors</span></summary>
+      <div class="tools" id="tools">
+        <label><input type="checkbox" id="clipOn"> Clip</label>
+        <input type="text" id="clipA" placeholder="0:00" disabled>
+        <span style="color:var(--dim)">→</span>
+        <input type="text" id="clipB" placeholder="1:30" disabled>
+        <span style="color:var(--dim);font-size:12px">snaps to keyframe</span>
+        <label id="qtLabel" style="margin-left:auto" title="Download H.264 so files play in QuickTime / Apple devices. VP9/AV1 (higher quality) don't play there. Slightly lower quality at 1080p; unavailable above ~1080p.">
+          <input type="checkbox" id="qtOn"> QuickTime (H.264)</label>
+        <label id="turboLabel" title="Download over many parallel connections (aria2c) — much faster for one big file. Prepares the whole file first, so there's a short wait before it saves.">
+          <input type="checkbox" id="turboOn"> ⚡ Turbo</label>
+        <label id="sbLabel" title="Remove sponsor/intro/outro segments (SponsorBlock). Prepares the full video first, so it's slower.">
+          <input type="checkbox" id="sbOn"> Skip sponsors</label>
+      </div>
+    </details>
+    <div class="chips" id="subs" style="display:none"></div>
+    <div class="galbar" id="galbar" style="display:none"></div>
+    <div class="gal" id="gallery" style="display:none"></div>
+    <div class="grid" id="grid"></div>
+  </div>
+
+  <div class="card" id="plcard">
+    <div class="plhead">
+      <h2 id="pltitle"></h2>
+      <label style="font-size:13px;color:var(--muted);display:flex;align-items:center;gap:6px">
+        <input type="checkbox" id="plall" checked> all</label>
+      <select id="plq">
+        <option value="best">Best quality</option>
+        <option value="1080" selected>Up to 1080p</option>
+        <option value="720">Up to 720p</option>
+        <option value="audio">Audio only</option>
+      </select>
+      <label style="font-size:13px;color:var(--muted);display:flex;align-items:center;gap:6px">
+        <span id="pllane" title="How many videos download at once. Capped by the server's MAX_CONCURRENCY."></span></label>
+      <label id="plTurboLabel" style="font-size:13px;color:var(--muted);display:flex;align-items:center;gap:5px"
+        title="Download each video over many parallel connections (aria2c) — max speed, but prepares each file first (short wait, no live progress).">
+        <input type="checkbox" id="plTurbo"> ⚡</label>
+      <button class="btn" id="plgo" style="padding:10px 18px">YoinkT selected</button>
+    </div>
+    <div id="plprog" style="display:none;padding:0 16px 12px">
+      <div style="display:flex;justify-content:space-between;align-items:center;font-size:12.5px;color:var(--muted);margin-bottom:5px">
+        <span id="plprogtxt"></span>
+        <span style="display:flex;align-items:center;gap:8px">
+          <span id="plprogeta"></span>
+          <button class="plbtn" id="plpause">⏸ Pause all</button>
+          <button class="plbtn" id="plcancel">✕ Cancel all</button>
+        </span>
+      </div>
+      <div style="height:6px;background:var(--border);border-radius:3px;overflow:hidden">
+        <i id="plprogbar" style="display:block;height:100%;width:0;background:var(--accent);transition:width .3s"></i>
+      </div>
+    </div>
+    <div id="plrows"></div>
+  </div>
+
+  <div id="cookiehelp" style="display:none;margin-top:14px;background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:14px 16px;font-size:13.5px;color:var(--muted)">
+    <b style="color:var(--text)">Video needs sign-in / age-restricted?</b>
+    “Sign in to confirm your age” is a hard gate — YouTube now requires a logged-in session and there’s no reliable no-login bypass (YoinkT auto-retries the old client tricks; they’re mostly patched). Export a <code>cookies.txt</code> from a logged-in browser (a “Get cookies.txt” extension) — a <b>throwaway Google account</b> works fine, it just needs to be signed in — save it in the project folder, then:
+    <pre style="background:var(--raise);border:1px solid var(--border);border-radius:8px;padding:10px;margin:8px 0 0;overflow:auto;color:var(--text);font-size:12px">COOKIES_FILE=./cookies.txt ./run-local.sh</pre>
+    <span style="font-size:12px">Per-site cookies also work: <code>COOKIES_FILE_YOUTUBE</code>, <code>_INSTAGRAM</code>, <code>_FACEBOOK</code>, etc. This also unlocks members-only + premium-bitrate formats.</span>
+  </div>
+
+  <div id="sitebar" style="display:none;margin-top:16px;padding:12px 16px;background:var(--panel);border:1px solid var(--border);border-radius:12px">
+    <div style="font-size:12px;color:var(--dim);margin-bottom:8px">Sign-in status — upload a <code>cookies.txt</code> per site (a “Get cookies.txt” browser extension exports it). Unlocks private/age-gated/photo posts.</div>
+    <div id="sitechips" style="display:flex;flex-wrap:wrap;gap:8px"></div>
+    <input type="file" id="ckfile" accept=".txt" style="display:none">
+  </div>
+
+  <footer>
+    <span>Merges land as MP4. <a href="#" id="cookielink" style="color:var(--accent-hi)">Video needs sign-in?</a></span>
+    <span id="ver"></span>
+  </footer>
+</div>
+
+<div id="toasts"></div>
+<div id="lb"><span class="cl">✕</span><img alt=""></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const store = (k,v) => v === undefined ? JSON.parse(localStorage.getItem(k)||"null") : localStorage.setItem(k,JSON.stringify(v));
+
+// Optional API key (public deploys set API_KEY on the server). Stored locally;
+// injected as X-API-Key on every fetch AND as ?key= on anchor/blob download
+// URLs (anchors can't send headers).
+let apiKey = store("YoinkT-key") || "";
+const keyQS = () => apiKey ? "&key=" + encodeURIComponent(apiKey) : "";
+const _fetch = window.fetch.bind(window);
+window.fetch = (u, opt = {}) => {
+  if (apiKey && typeof u === "string" && u.startsWith("/api")) {
+    opt = { ...opt, headers: { ...(opt.headers || {}), "X-API-Key": apiKey } };
+  }
+  return _fetch(u, opt);
+};
+
+let serverMax = 4;
+fetch("/api/health").then(r=>r.json()).then(h=>{
+  $("ver").textContent = h.version || "OLD BUILD";
+  serverMax = h.max_concurrency || 4;
+  if (!h.turbo) {  // aria2c not installed -> disable Turbo everywhere with a hint
+    for (const id of ["turboOn", "plTurbo"]) {
+      const t = $(id); if (t) { t.checked = false; t.disabled = true; }
+    }
+    const tip = "Turbo needs aria2c on the server (macOS: brew install aria2, then rerun).";
+    if ($("turboLabel")) { $("turboLabel").style.opacity = ".5"; $("turboLabel").title = tip; }
+    if ($("plTurboLabel")) { $("plTurboLabel").style.opacity = ".5"; $("plTurboLabel").title = tip; }
+  }
+  if (h.js_runtime === false) {  // no Deno/Node -> YouTube may hard-throttle
+    $("ver").textContent += " · ⚠ no JS runtime (throttle risk)";
+    $("ver").title = "Install Deno so yt-dlp can solve YouTube's throttle challenge: brew install deno";
+  }
+  if (h.gallery_dl === false) {  // no gallery-dl -> photo posts can't resolve
+    $("ver").textContent += " · ⚠ no gallery-dl (photos off)";
+    $("ver").title = "Install gallery-dl for X/IG/FB photo posts: pip install gallery-dl";
+  }
+  const sel = document.createElement("select");
+  sel.id = "pllanes";
+  for (let i = 1; i <= serverMax; i++) {
+    const o = document.createElement("option");
+    o.value = i; o.textContent = i + (i === 1 ? " lane" : " lanes");
+    if (i === (store("YoinkT-lanes") || Math.min(3, serverMax))) o.selected = true;
+    sel.appendChild(o);
+  }
+  const host = $("pllane"); host.textContent = ""; host.appendChild(sel);
+  if (h.api_key && !apiKey) {  // server requires a key and we don't have one
+    const k = prompt("This server requires an API key:");
+    if (k) { apiKey = k; store("YoinkT-key", k); }
+  }
+  renderSiteBar(h);
+}).catch(()=>{});
+
+// ---- per-site sign-in status + cookies.txt upload ----
+const SITE_LABEL = {youtube:"YouTube", x:"𝕏", facebook:"Facebook", instagram:"Instagram", tiktok:"TikTok"};
+let cookieTargetSite = null;
+function renderSiteBar(h){
+  const sites = h.sites || {};
+  const names = Object.keys(sites);
+  if (!names.length || h.cookie_upload === false) { $("sitebar").style.display = "none"; return; }
+  const bar = $("sitechips"); bar.innerHTML = "";
+  for (const s of names) {
+    const on = sites[s].cookies;
+    const chip = document.createElement("span");
+    chip.className = "chip"; chip.style.cursor = "pointer";
+    chip.style.borderColor = on ? "var(--ok)" : "var(--border)";
+    chip.innerHTML = `${SITE_LABEL[s]||s} ${on ? '<b style="color:var(--ok)">✓ signed in</b>' : '<span style="color:var(--dim)">+ cookies</span>'}`;
+    chip.title = on ? "Cookies loaded — click to replace or clear" : "Upload cookies.txt for "+s;
+    chip.onclick = () => { cookieTargetSite = s; $("ckfile").click(); };
+    bar.appendChild(chip);
+  }
+  $("sitebar").style.display = "block";
+}
+$("ckfile").onchange = async () => {
+  const f = $("ckfile").files[0]; if (!f || !cookieTargetSite) return;
+  try {
+    const txt = await f.text();
+    const r = await fetch("/api/cookies/" + cookieTargetSite, {method:"POST", body: txt});
+    if (!r.ok) throw new Error((await r.json().catch(()=>({}))).detail || r.statusText);
+    const h = await (await fetch("/api/health")).json();
+    renderSiteBar(h);
+  } catch (ex) {
+    $("err").textContent = "Cookie upload failed: " + ex.message; $("err").style.display = "block";
+  } finally { $("ckfile").value = ""; }
+};
+// restore saved quality preference
+const savedQ = store("YoinkT-quality");
+if (savedQ) { const q = $("plq"); if ([...q.options].some(o => o.value === savedQ)) q.value = savedQ; }
+
+const theme = t => { if(t) document.documentElement.setAttribute("data-theme",t); else document.documentElement.removeAttribute("data-theme"); store("YoinkT-theme", t||""); };
+theme(store("YoinkT-theme") || (matchMedia("(prefers-color-scheme: light)").matches ? "light" : ""));
+const flip = () => theme(document.documentElement.getAttribute("data-theme") ? "" : "light");
+$("theme").onclick = flip; $("themeIdle").onclick = flip;
+
+// ---- toasts (non-blocking; replaces layout-shoving messages) ----
+function toast(msg, kind){
+  const t = document.createElement("div");
+  t.className = "toast" + (kind ? " " + kind : "");
+  t.innerHTML = `<span>${msg}</span><span class="x">✕</span>`;
+  t.querySelector(".x").onclick = () => t.remove();
+  $("toasts").appendChild(t);
+  setTimeout(() => { t.style.transition = "opacity .3s"; t.style.opacity = "0";
+    setTimeout(() => t.remove(), 300); }, kind === "err" ? 7000 : 4000);
+  return t;
+}
+
+// ---- lightbox ----
+function lightbox(src){ const lb = $("lb"); lb.querySelector("img").src = src; lb.classList.add("on"); }
+$("lb").onclick = e => { if (e.target !== $("lb").querySelector("img")) $("lb").classList.remove("on"); };
+document.addEventListener("keydown", e => { if (e.key === "Escape") $("lb").classList.remove("on"); });
+
+// ---- site detection (shared by paste + live input icon) ----
+const SITE_ICON = {
+  youtube:{t:"▶",bg:"#ff0033"}, x:{t:"𝕏",bg:"#000"}, facebook:{t:"f",bg:"#1877f2"},
+  instagram:{t:"◎",bg:"#c13584"}, tiktok:{t:"♪",bg:"#000"} };
+function detectSite(u){
+  if (/^https?:\/\/(www\.|m\.|music\.)?(youtube\.com|youtu\.be)\//i.test(u)) return "youtube";
+  if (/^https?:\/\/(www\.|mobile\.)?(x\.com|twitter\.com)\/\w+\/status\/\d+/i.test(u)) return "x";
+  if (/^https?:\/\/((www|m|web)\.)?facebook\.com\/(watch|reel\/|share\/[vrp]\/|video\.php|photo|permalink\.php|story\.php|[\w.]+\/(videos|posts|photos)\/)/i.test(u)
+      || /^https?:\/\/fb\.watch\//i.test(u)) return "facebook";
+  if (/^https?:\/\/(www\.)?instagram\.com\/([\w.]+\/)?(p|reel|reels|tv)\//i.test(u)) return "instagram";
+  if (/^https?:\/\/((www|m)\.)?tiktok\.com\/(@[\w.]+\/(video|photo)\/|t\/)/i.test(u)
+      || /^https?:\/\/(vm|vt)\.tiktok\.com\//i.test(u)) return "tiktok";
+  return null;
+}
+$("url").addEventListener("input", () => {
+  const s = detectSite($("url").value.trim());
+  const ic = $("siteicon"), bar = $("f");
+  if (s) { ic.textContent = SITE_ICON[s].t; ic.style.background = SITE_ICON[s].bg;
+    ic.style.display = "flex"; bar.classList.add("detected"); }
+  else { ic.style.display = "none"; bar.classList.remove("detected"); }
+});
+
+const mb = n => n ? (n/1048576 >= 1024 ? (n/1073741824).toFixed(2)+" GB" : (n/1048576).toFixed(1)+" MB") : "size unknown";
+const fdur = s => { if(!s) return ""; const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;
+  return (h?h+":"+String(m).padStart(2,"0"):m)+":"+String(x).padStart(2,"0"); };
+// ETA string for a live download: " · ~1:23 left" (only when size+speed known)
+const etaStr = (got, est, spd) => (est > got && spd > 0)
+  ? ` · ~${fdur(Math.round((est - got) / spd))} left` : "";
+const badge = f =>
+  f.kind === "mp3" ? '<span class="badge a">mp3</span>'
+  : f.kind.startsWith("a:") ? '<span class="badge a">audio</span>'
+  : f.kind.startsWith("c:") ? '<span class="badge p">plays everywhere</span>'
+  : f.note === "progressive" ? '<span class="badge p">direct</span>'
+  : `<span class="badge m">${(f.note.split("· ")[1]||"merged")}</span>`;
+const qtWarn = f =>
+  /vp9|av1/.test(f.note) ? "Best quality (VP9/AV1) — QuickTime can't play this codec. Use VLC, IINA, or a browser. For QuickTime, pick the 'plays everywhere' option." : "";
+const safeName = t => (t||"video").replace(/[\\/:*?"<>|]+/g,"_").slice(0,120);
+
+let currentUrl = "", currentTitle = "", currentSite = "youtube";
+
+const parseT = s => {
+  if (!s) return null;
+  const p = s.trim().split(":").map(Number);
+  if (p.some(isNaN)) return null;
+  return p.reduce((a, v) => a * 60 + v, 0);
+};
+const clipQS = () => {
+  if (!$("clipOn").checked) return "";
+  const a = parseT($("clipA").value), b = parseT($("clipB").value);
+  return (a !== null && b !== null && b > a) ? `&start=${a}&end=${b}` : "";
+};
+const sbQS = () => $("sbOn").checked ? "&sb=1" : "";
+const turboQS = () => $("turboOn").checked ? "&turbo=1" : "";
+const codecQS = () => $("qtOn").checked ? "&codec=h264" : "";
+// persist the QuickTime preference; re-render the format grid on toggle so
+// the badges reflect what will actually be downloaded.
+let renderGrid = null;
+$("qtOn").checked = !!store("YoinkT-qt");
+$("qtOn").onchange = () => { store("YoinkT-qt", $("qtOn").checked); if (renderGrid) renderGrid(); };
+$("clipOn").onchange = () => {
+  $("clipA").disabled = $("clipB").disabled = !$("clipOn").checked;
+};
+$("cookielink").onclick = e => {
+  e.preventDefault();
+  const c = $("cookiehelp");
+  c.style.display = c.style.display === "none" ? "block" : "none";
+};
+
+const REC_TAG = {youtube:"▶", x:"𝕏", facebook:"f", instagram:"◎", tiktok:"♪"};
+function renderRecents(){
+  const rs = store("YoinkT-recents") || [];
+  $("recents").innerHTML = "";
+  for (const r of rs) {
+    const d = document.createElement("div");
+    d.className = "rec"; d.title = r.t;
+    const tag = REC_TAG[r.s || detectSite(r.u) || ""] || "";
+    d.innerHTML = `<img src="${r.th}" alt="">${tag ? `<span style="position:absolute;left:3px;top:3px;background:rgba(0,0,0,.7);color:#fff;border-radius:4px;padding:0 4px;font-size:9px;font-weight:700">${tag}</span>` : ""}<div>${r.t}</div>`;
+    d.style.position = "relative";
+    d.onclick = () => { $("url").value = r.u; $("url").dispatchEvent(new Event("input")); route(r.u); };
+    $("recents").appendChild(d);
+  }
+  if (rs.length) {
+    const c = document.createElement("div");
+    c.className = "rec"; c.style.cssText = "display:flex;align-items:center;justify-content:center;font-size:11px;color:var(--muted);height:auto";
+    c.innerHTML = "<div style='padding:14px 4px'>✕ clear</div>";
+    c.title = "Clear recents";
+    c.onclick = () => { store("YoinkT-recents", []); renderRecents(); };
+    $("recents").appendChild(c);
+  }
+}
+renderRecents();
+
+function remember(u,t,th){
+  let rs = (store("YoinkT-recents")||[]).filter(r => r.u !== u);
+  rs.unshift({u,t,th,s:detectSite(u)}); rs = rs.slice(0,6);
+  store("YoinkT-recents", rs); renderRecents();
+}
+
+// ---- drag-drop: a link anywhere, or a cookies.txt onto a site chip ----
+document.addEventListener("dragover", e => { e.preventDefault(); });
+document.addEventListener("drop", e => {
+  e.preventDefault();
+  const txt = e.dataTransfer.getData("text/uri-list") || e.dataTransfer.getData("text/plain");
+  const url = (txt || "").trim().split("\n")[0];
+  if (url && detectSite(url)) {
+    $("url").value = url; $("url").dispatchEvent(new Event("input")); route(url);
+    toast("Fetching dropped link…", "");
+  } else if (url) {
+    toast("Not a supported link", "err");
+  }
+});
+
+const HAS_PICKER = !!window.showSaveFilePicker;
+
+// Download control: pause (stop reading -> server backpressures -> stream
+// pauses; the idle watchdog is suspended so a pause doesn't abort), resume,
+// and cancel (abort the fetch -> server kills its subprocess + frees the slot).
+const activeDls = new Set();
+let batchPaused = false, batchCancelled = false;
+class DL {
+  constructor(){ this.paused = false; this.cancelled = false; this._r = null; this.ctl = new AbortController(); }
+  pause(){ if (!this.cancelled && !this.paused){ this.paused = true; this.onchange && this.onchange(); } }
+  resume(){ if (this.paused){ this.paused = false; const r = this._r; this._r = null; if (r) r(); this.onchange && this.onchange(); } }
+  cancel(){ if (!this.cancelled){ this.cancelled = true; this.ctl.abort(); const r = this._r; this._r = null; if (r) r(); this.onchange && this.onchange(); } }
+  // called before each read; blocks while paused, throws AbortError on cancel
+  async gate(onPause, onResume){
+    if (this.cancelled) throw new DOMException("cancelled", "AbortError");
+    if (this.paused){
+      onPause && onPause();
+      await new Promise(res => { this._r = res; });
+      onResume && onResume();
+      if (this.cancelled) throw new DOMException("cancelled", "AbortError");
+    }
+  }
+}
+
+function anchorGrab(href, name){
+  const a = document.createElement("a");
+  a.href = href; a.download = name || ""; a.rel = "noopener";
+  a.style.display = "none";
+  document.body.appendChild(a); a.click();
+  setTimeout(() => a.remove(), 1000);
+}
+
+// Reliable fallback for browsers without File System Access (Brave, Firefox):
+// stream the response through fetch, so we SEE real progress AND real errors
+// (a 0-byte / age-restricted / region-locked video now throws instead of
+// silently saving an empty file), then hand the assembled blob to the
+// browser's download. Holds the file in memory — fine for typical videos;
+// huge (>2.5 GB) files fall back to fire-and-forget anchor to avoid OOM.
+const BLOB_LIMIT = 2.5 * 1073741824;
+const IDLE_MS = 60000;  // abort a download that receives NO data for this long
+async function blobGrab(href, name, onProgress, idleMs, dl){
+  const IDLE = idleMs || IDLE_MS;  // buffered (turbo/sb) waits longer for first byte
+  // AbortController + idle watchdog: reset a timer on every chunk; if no data
+  // arrives for IDLE_MS the fetch is aborted so the lane never hangs forever.
+  // When a dl is passed, its controller is reused so cancel() aborts the fetch.
+  const ctl = dl ? dl.ctl : new AbortController();
+  let timer;
+  const bump = () => { clearTimeout(timer); timer = setTimeout(() => ctl.abort(), IDLE); };
+  bump();
+  let r;
+  try { r = await fetch(href, {signal: ctl.signal}); }
+  catch { clearTimeout(timer); if (dl && dl.cancelled) throw new DOMException("cancelled", "AbortError"); throw new Error("stalled before any data — retry"); }
+  if (!r.ok) {
+    clearTimeout(timer);
+    let msg = r.statusText;
+    try { msg = (await r.json()).detail || msg; } catch {}
+    throw new Error(msg);
+  }
+  const total = +r.headers.get("Content-Length") || 0;
+  if (total && total > BLOB_LIMIT) { clearTimeout(timer); ctl.abort(); anchorGrab(href, name); return -1; }
+  const reader = r.body.getReader();
+  const chunks = []; let got = 0, t0 = performance.now();
+  try {
+    while (true) {
+      // pause gate: suspend the idle watchdog while paused so a pause never aborts
+      if (dl) await dl.gate(() => clearTimeout(timer), () => bump());
+      const {done, value} = await reader.read();
+      if (done) break;
+      chunks.push(value); got += value.length; bump();
+      onProgress && onProgress(got, total, got / ((performance.now()-t0)/1000));
+    }
+  } catch (e) {
+    clearTimeout(timer);
+    if (e.name === "AbortError") throw new DOMException("cancelled", "AbortError");
+    throw new Error(got ? "connection dropped mid-download — retry" : "stalled — retry");
+  }
+  clearTimeout(timer);
+  if (got === 0) throw new Error("server sent 0 bytes — video may be age-restricted, private, or region-locked (see server log)");
+  const u = URL.createObjectURL(new Blob(chunks));
+  const a = document.createElement("a");
+  a.href = u; a.download = name || ""; a.click();
+  setTimeout(() => URL.revokeObjectURL(u), 15000);
+  return got;
+}
+
+async function download(f, el){
+  if (el.classList.contains("busy") || el.dataset.going) return;  // ignore repeat clicks
+  el.dataset.going = "1";
+  const clip = $("clipOn").checked;
+  const buffered = !clip && ($("turboOn").checked || $("sbOn").checked);  // server prepares first
+  const href = "/api/download?url="+encodeURIComponent(currentUrl)+"&kind="+encodeURIComponent(f.kind)+clipQS()+sbQS()+turboQS()+codecQS()+keyQS();
+  const meta = el.querySelector(".m"), orig = meta.innerHTML, bar = el.querySelector(".prog i");
+  const clear = () => { delete el.dataset.going; };
+  const outExt = buffered ? ((f.kind === "mp3" || f.kind.startsWith("a:")) ? "mp3" : "mp4") : f.ext;
+  // Resumable formats (progressive/audio, Range-backed, not clipped/buffered)
+  // download browser-native so the browser can RESUME an interrupted download
+  // and skip the memory blob. Merged/mp3/clip/turbo/SB have no seekable source.
+  // YouTube ONLY: social CDNs (twimg/fbcdn/igcdn) can reject the proxied
+  // request, and a fire-and-forget anchor HIDES that failure (v30 lesson —
+  // "fetch works but download doesn't"). Non-YouTube falls through to
+  // blobGrab/picker, which surfaces real errors.
+  if (f.resumable && !clip && !buffered && currentSite === "youtube") {
+    anchorGrab(href, safeName(currentTitle)+"."+f.ext);
+    el.classList.add("done"); setTimeout(()=>el.classList.remove("done"),3000);
+    clear(); return;
+  }
+  el.classList.add("busy");
+  const dl = new DL(); el._dl = dl; activeDls.add(dl);
+  // controls (pause/resume/cancel) + stats, re-rendered together each tick.
+  // The button's click handler (set in fetchInfo) reads data-act to run them.
+  const ctlHtml = () => `<span class="dlctl" data-act="pause" title="Pause/resume">${dl.paused ? "▶" : "⏸"}</span>`+
+    `<span class="dlctl" data-act="cancel" title="Cancel">✕</span> `;
+  const stat = txt => { meta.innerHTML = ctlHtml() + txt; };
+  dl.onchange = () => { if (dl.cancelled) return; stat(dl.paused ? "<b>paused</b>" : "<b>resuming…</b>"); };
+  stat(buffered ? `<b>preparing…</b> ${$("turboOn").checked ? "turbo" : "removing sponsors"}` : `<b>starting…</b>`);
+  try {
+    if (!HAS_PICKER) {
+      const n = await blobGrab(href, safeName(currentTitle)+"."+outExt, (got, total, spd) => {
+        const est = total || f.filesize || 0;  // merged/mp3 have no Content-Length; use info size
+        if (bar) bar.style.width = est ? Math.min(100, got/est*100)+"%" : Math.min(95, got/2e7*100)+"%";
+        stat(`<b>${mb(got)}</b>${spd ? ` · ${(spd/1048576).toFixed(1)} MB/s` : ""}${etaStr(got, est, spd)}`);
+      }, buffered ? 600000 : undefined, dl);
+      el.classList.remove("busy"); meta.innerHTML = orig;
+      if (n !== -1) { el.classList.add("done"); setTimeout(()=>el.classList.remove("done"),4000); toast(f.label + " saved ✓", "ok"); }
+      return;
+    }
+    const handle = await showSaveFilePicker({suggestedName: safeName(currentTitle)+"."+outExt}).catch(()=>null);
+    if (!handle) { el.classList.remove("busy"); meta.innerHTML = orig; return; }
+    const w = await handle.createWritable();
+    const r = await fetch(href, {signal: dl.ctl.signal});
+    if (!r.ok) throw new Error((await r.json().catch(()=>({}))).detail || r.statusText);
+    const total = +r.headers.get("Content-Length") || f.filesize || 0;
+    const reader = r.body.getReader();
+    let got = 0, t0 = performance.now();
+    while (true) {
+      await dl.gate();
+      const {done, value} = await reader.read();
+      if (done) break;
+      await w.write(value); got += value.length;
+      const spd = got / ((performance.now()-t0)/1000);
+      const est = total || f.filesize || 0;
+      bar.style.width = est ? Math.min(100, got/est*100)+"%" : Math.min(95, got/2e7*100)+"%";
+      stat(`<b>${mb(got)}</b> · ${(spd/1048576).toFixed(1)} MB/s${etaStr(got, est, spd)}`);
+    }
+    await w.close();
+    el.classList.remove("busy"); el.classList.add("done");
+    meta.innerHTML = orig;
+    setTimeout(()=>el.classList.remove("done"), 5000);
+    toast(f.label + " saved ✓", "ok");
+  } catch (ex) {
+    el.classList.remove("busy"); meta.innerHTML = orig;
+    if (ex.name !== "AbortError") {  // AbortError = user cancelled, not an error
+      toast("Download failed: " + ex.message, "err");
+    }
+  } finally {
+    activeDls.delete(dl); el._dl = null; clear();
+  }
+}
+
+// ---- gallery media picker (photos + per-video items of a post) ----
+// blobGrab, NOT anchor: anchors hide server errors (v30 X CDN-403 bug).
+async function grabMedia(mi, item){
+  if (item && item._busy) return;
+  if (item) { item._busy = true; item.querySelector(".st") && (item.querySelector(".st").textContent = "…"); }
+  try {
+    const nm = safeName(currentTitle) + "_" + mi.label.replace(/\s+/g, "").toLowerCase() + "." + mi.ext;
+    await blobGrab("/api/download?url=" + encodeURIComponent(currentUrl) +
+      "&kind=" + encodeURIComponent(mi.kind) + keyQS(), nm,
+      (got, total) => { if (item) { const s = item.querySelector(".st"); if (s) s.textContent = mb(got); } });
+    if (item) { const s = item.querySelector(".st"); if (s) s.textContent = "saved ✓"; }
+    toast(mi.label + " saved ✓", "ok");
+  } catch (ex) {
+    if (ex.name !== "AbortError") { toast(mi.label + " failed: " + ex.message, "err");
+      if (item) { const s = item.querySelector(".st"); if (s) s.textContent = "error"; } }
+  } finally { if (item) item._busy = false; }
+}
+
+async function grabZip(photos, btn){
+  if (btn) { btn.disabled = true; btn.textContent = "Zipping…"; }
+  try {
+    await blobGrab("/api/download?url=" + encodeURIComponent(currentUrl) + "&kind=z:all" + keyQS(),
+      safeName(currentTitle) + "_photos.zip");
+    toast(`${photos.length} photos zipped ✓`, "ok");
+  } catch (ex) {
+    if (ex.name !== "AbortError") toast("ZIP failed: " + ex.message, "err");
+  } finally { if (btn) { btn.disabled = false; btn.textContent = "⬇ ZIP all photos"; } }
+}
+
+function renderGallery(media){
+  const gal = $("gallery"), bar = $("galbar");
+  gal.innerHTML = ""; bar.innerHTML = "";
+  if (!media.length) { gal.style.display = "none"; bar.style.display = "none"; return; }
+  const photos = media.filter(m => m.type === "photo");
+  const selected = new Set();
+  const items = [];
+  media.forEach((mi, idx) => {
+    const it = document.createElement("div");
+    it.className = "gitem"; it.dataset.idx = idx; items.push(it);
+    it.innerHTML =
+      (mi.thumbnail ? `<img src="${mi.thumbnail}" alt="" loading="lazy">` : "") +
+      `<span class="tag">${mi.type === "photo" ? "PHOTO" : (mi.duration ? fdur(mi.duration) : "VIDEO")}</span>` +
+      (mi.type === "video" ? '<span class="play">▶</span>' : "") +
+      `<span class="ck">${mi.type === "photo" ? "" : "▤"}</span>` +
+      `<span class="st"></span>`;
+    // photo: click selects; double-click/preview via the thumbnail long-press.
+    // video: click downloads directly (no multi-select needed for one file each).
+    it.onclick = (e) => {
+      if (mi.type === "video") { grabMedia(mi, it); return; }
+      if (selected.has(idx)) { selected.delete(idx); it.classList.remove("sel"); }
+      else { selected.add(idx); it.classList.add("sel"); }
+      it.querySelector(".ck").textContent = selected.has(idx) ? "✓" : "";
+      updateBar();
+    };
+    // long-press / right area preview
+    const img = it.querySelector("img");
+    if (img && mi.type === "photo") img.ondblclick = (e) => { e.stopPropagation(); lightbox(mi.thumbnail); };
+    gal.appendChild(it);
+  });
+
+  function updateBar(){
+    const n = selected.size;
+    grabSelBtn.style.display = n ? "" : "none";
+    grabSelBtn.textContent = `⬇ Grab ${n} selected`;
+  }
+  const mkbtn = (txt, cls) => { const b = document.createElement("button");
+    b.className = "plbtn" + (cls ? " " + cls : ""); b.textContent = txt; return b; };
+  // grab all (videos individually + photos as one zip when >1)
+  const grabAll = mkbtn(`⬇ Grab all (${media.length})`, "pri");
+  grabAll.onclick = async () => {
+    grabAll.disabled = true;
+    if (photos.length > 1) await grabZip(photos);
+    else for (const mi of photos) await grabMedia(mi, items[media.indexOf(mi)]);
+    for (const mi of media.filter(m => m.type === "video")) await grabMedia(mi, items[media.indexOf(mi)]);
+    grabAll.disabled = false;
+  };
+  bar.appendChild(grabAll);
+  if (photos.length > 1) {
+    const zip = mkbtn("⬇ ZIP all photos");
+    zip.onclick = () => grabZip(photos, zip);
+    bar.appendChild(zip);
+  }
+  const grabSelBtn = mkbtn("⬇ Grab selected");
+  grabSelBtn.style.display = "none";
+  grabSelBtn.onclick = async () => {
+    grabSelBtn.disabled = true;
+    for (const idx of selected) await grabMedia(media[idx], items[idx]);
+    grabSelBtn.disabled = false;
+  };
+  bar.appendChild(grabSelBtn);
+  if (photos.length > 1) {
+    const info = document.createElement("span");
+    info.style.cssText = "font-size:12px;color:var(--dim);margin-left:4px";
+    info.textContent = "tap photos to select · double-tap to preview";
+    bar.appendChild(info);
+  }
+  gal.style.display = "grid"; bar.style.display = "flex";
+}
+
+async function fetchInfo(u){
+  currentUrl = u;
+  $("err").style.display = "none"; $("card").style.display = "none";
+  $("skel").style.display = "block"; $("go").disabled = true; $("go").textContent = "Fetching…";
+  document.body.classList.remove("idle");
+  try {
+    const r = await fetch("/api/info?url="+encodeURIComponent(u));
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    const d = await r.json();
+    currentTitle = d.title;
+    currentSite = d.site || "youtube";
+    const isYT = currentSite === "youtube";
+    const SITE_TAG = {x: "𝕏", facebook: "Facebook", instagram: "Instagram", tiktok: "TikTok"};
+    $("thumb").src = d.thumbnail || "";
+    $("bg").style.backgroundImage = d.thumbnail ? `url(${d.thumbnail})` : "";
+    $("bg").style.opacity = d.thumbnail ? "1" : "0";
+    $("title").textContent = d.title;
+    $("sub").textContent = (SITE_TAG[currentSite] ? SITE_TAG[currentSite] + " · " : "") + (d.channel || "");
+    $("dur").textContent = fdur(d.duration);
+    $("dur").style.display = d.duration ? "block" : "none";
+    remember(u, d.title, d.thumbnail);
+    const grid = $("grid");
+    const vids = d.formats.filter(f => !f.kind.startsWith("a:"));
+    renderGrid = () => {
+      const qt = $("qtOn").checked;
+      grid.innerHTML = "";
+      d.formats.forEach((f) => {
+        const el = document.createElement("button");
+        el.type = "button";
+        el.className = "fmt" + (vids.length && f === vids[0] ? " big" : "");
+        // QuickTime mode: a merged format with no H.264 at its height will
+        // fall back to VP9/AV1 and won't play in QuickTime — flag it.
+        const merged = f.kind.startsWith("m:");
+        const noQt = qt && merged && f.h264 === false;
+        const bdg = qt && merged && f.h264 ? '<span class="badge p">h264 · quicktime</span>'
+          : noQt ? '<span class="badge m">vp9/av1 · not quicktime</span>' : badge(f);
+        const warn = noQt ? "No H.264 at this resolution — will download as VP9/AV1 (won't play in QuickTime). Use a lower resolution or a different player."
+          : (qt && merged && f.h264) ? "" : qtWarn(f);
+        if (warn) el.title = warn;
+        el.innerHTML =
+          `<span class="q">${f.label}${f.fps && f.fps > 30 ? `<small>${f.fps}fps</small>` : ""}</span>`+
+          `<span class="m"><b>${(qt && merged && f.h264 ? "MP4" : f.ext.toUpperCase())}</b> · ${mb(f.filesize)}${f.tbr ? ` · ${(f.tbr/1000).toFixed(1)} Mbps` : ""}<br>${bdg}</span>`;
+        const prog = document.createElement("span");
+        prog.className = "prog"; prog.innerHTML = "<i></i>";
+        el.style.flexWrap = "wrap"; el.appendChild(prog);
+        prog.style.cssText = "flex-basis:100%";
+        el.onclick = (e) => {
+          const act = e.target.dataset && e.target.dataset.act;
+          if (act) {  // a pause/cancel control was clicked, not the button
+            e.stopPropagation();
+            const dl = el._dl;
+            if (!dl) return;
+            if (act === "pause") { dl.paused ? dl.resume() : dl.pause(); }
+            else if (act === "cancel") { dl.cancel(); }
+            return;
+          }
+          download(f, el);
+        };
+        grid.appendChild(el);
+      });
+    };
+    renderGrid();
+    renderGallery(d.media || []);
+    // SponsorBlock is YouTube-only. QuickTime toggle matters where merge
+    // kinds exist (YouTube + Facebook); X/IG are already single-file H.264.
+    $("qtLabel").style.display = (isYT || currentSite === "facebook") ? "" : "none";
+    $("sbLabel").style.display = isYT ? "" : "none";
+    // options drawer only when there are video formats worth tuning
+    $("optdrawer").style.display = d.formats.length ? "block" : "none";
+    $("optdrawer").open = false;
+    if (!isYT) $("sbOn").checked = false;
+    const subs = $("subs");
+    if (d.subs && d.subs.length) {
+      subs.innerHTML = "<b>subtitles</b>";
+      for (const s of d.subs.slice(0, 12)) {
+        const c = document.createElement("button");
+        c.type = "button";
+        c.className = "chip" + (s.auto ? " auto" : "");
+        c.textContent = s.lang + (s.auto ? " (auto)" : "");
+        c.onclick = () => location.href =
+          "/api/subs?url=" + encodeURIComponent(u) + "&lang=" + encodeURIComponent(s.lang) + keyQS();
+        subs.appendChild(c);
+      }
+      subs.style.display = "flex";
+    } else subs.style.display = "none";
+    const hint = $("plhint");
+    if (/[?&]list=/.test(u)) {
+      hint.innerHTML = "";
+      const b = document.createElement("button");
+      b.textContent = "This video is part of a playlist — load the whole playlist";
+      b.onclick = () => loadPlaylist(u);
+      hint.appendChild(b);
+      hint.style.display = "block";
+    } else hint.style.display = "none";
+    $("card").style.display = "block";
+  } catch (ex) {
+    $("err").textContent = ex.message; $("err").style.display = "block";
+  } finally {
+    $("skel").style.display = "none";
+    $("go").disabled = false; $("go").textContent = "YoinkT";
+  }
+}
+
+let plEntries = [];
+
+async function loadPlaylist(u){
+  $("err").style.display = "none"; $("card").style.display = "none";
+  $("plcard").style.display = "none"; $("skel").style.display = "block";
+  document.body.classList.remove("idle");
+  try {
+    const r = await fetch("/api/playlist?url=" + encodeURIComponent(u));
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    const d = await r.json();
+    plEntries = d.entries;
+    const na = d.count - (d.available ?? d.count);
+    $("pltitle").innerHTML = `${d.title} — ${d.available ?? d.count} videos` +
+      (na > 0 ? ` <span style="color:var(--dim);font-weight:400;font-size:13px">(${na} unavailable, skipped)</span>` : "") +
+      (HAS_PICKER ? "" : `<br><span style="font-size:12px;color:var(--dim);font-weight:400">`+
+        `Files save to your Downloads folder. Failed videos show a red “error ↻” — click the row to retry. `+
+        `If the browser asks to “allow multiple downloads”, say yes.</span>`);
+    const rows = $("plrows"); rows.innerHTML = "";
+    d.entries.forEach((e, i) => {
+      const row = document.createElement("div");
+      const ok = e.available !== false;
+      row.className = "plrow" + (ok ? "" : " na"); row.dataset.i = i;
+      row.innerHTML =
+        `<input type="checkbox" class="plsel" ${ok ? "checked" : "disabled"}>`+
+        `<img src="${e.thumbnail || ""}" alt="" loading="lazy">`+
+        `<span class="t" title="${(e.title||"").replace(/"/g,"&quot;")}">${e.title || (ok ? "…" : "Unavailable video")}</span>`+
+        `<span style="color:var(--dim);font:600 12px ui-monospace,monospace">${fdur(e.duration)}</span>`+
+        `<span class="st">${ok ? "queued" : "unavailable"}</span>`;
+      rows.appendChild(row);
+    });
+    $("plcard").style.display = "block";
+  } catch (ex) {
+    $("err").textContent = ex.message; $("err").style.display = "block";
+  } finally { $("skel").style.display = "none"; }
+}
+
+$("plall").onchange = () =>
+  document.querySelectorAll(".plsel:not(:disabled)").forEach(c => { c.checked = $("plall").checked; });
+
+function pickFormat(formats, pref){
+  if (pref === "audio") return formats.find(f => f.kind.startsWith("a:"));
+  const vids = formats.filter(f => !f.kind.startsWith("a:") && !f.kind.startsWith("c:"));
+  if (pref === "best") return vids[0];
+  const cap = +pref;
+  return vids.find(f => f.height <= cap) || vids[vids.length - 1];
+}
+
+// Batch always uses blobGrab: no per-file save-picker prompts, real progress,
+// and crucially REAL errors — a failing video (age-restricted/region-locked)
+// now shows "error" with the reason instead of a silent 0-byte "done".
+// Picker mode is intentionally NOT used here: it needs a user gesture per
+// file, which parallel lanes can't provide.
+async function saveStream(href, suggested, onProgress, dl, idleMs){
+  return await blobGrab(href, suggested, (got) => onProgress && onProgress(got), idleMs, dl);
+}
+
+// batch pipelining: cache /api/info per URL and prefetch upcoming items so a
+// lane never sits idle waiting on extraction. Backend also caches extraction,
+// so the download-after-info starts instantly too. Cleared each batch run.
+let jsInfoCache = new Map();  // url -> Promise<info>
+function getInfo(url){
+  if (jsInfoCache.has(url)) return jsInfoCache.get(url);
+  const p = fetch("/api/info?url=" + encodeURIComponent(url))
+    .then(async r => { if (!r.ok) throw new Error((await r.json()).detail || r.statusText); return r.json(); });
+  p.catch(() => jsInfoCache.delete(url));  // don't cache failures
+  jsInfoCache.set(url, p);
+  return p;
+}
+
+// ---- batch aggregate progress ----
+let agg = null;  // {done,total,bytes,t0,active:Map(row->fraction 0..1)}
+function aggTick(){
+  if (!agg) return;
+  const el = performance.now() - agg.t0;
+  const rate = agg.bytes / (el / 1000);
+  $("plprogtxt").textContent =
+    `${agg.done}/${agg.total} done · ${mb(agg.bytes)} · ${(rate/1048576).toFixed(1)} MB/s`;
+  // smooth fill = completed files + fraction of each in-flight file
+  const partial = [...agg.active.values()].reduce((a, v) => a + v, 0);
+  const filled = Math.min(1, (agg.done + partial) / agg.total);
+  $("plprogbar").style.width = (filled * 100).toFixed(1) + "%";
+  let eta = "";
+  if (filled > 0.02 && filled < 1) {
+    eta = "~" + fdur(Math.round((el / filled - el) / 1000)) + " left";
+  }
+  $("plprogeta").textContent = eta;
+}
+
+async function grabOne(row, pref, attempt = 1){
+  if (batchCancelled) return;
+  const e = plEntries[+row.dataset.i];
+  const st = row.querySelector(".st");
+  row.className = "plrow run"; row.onclick = null; row.style.cursor = "";
+  const dl = new DL(); row._dl = dl; activeDls.add(dl);
+  if (batchPaused) dl.pause();
+  dl.onchange = () => { if (!dl.cancelled) st.textContent = dl.paused ? "paused" : "…"; };
+  try {
+    st.textContent = attempt > 1 ? "retrying" : "fetching";
+    const d = await getInfo(e.url);  // cached/prefetched -> usually instant
+    if (dl.cancelled) throw new DOMException("cancelled", "AbortError");
+    const f = pickFormat(d.formats, pref);
+    if (!f) throw new Error("no format");
+    const turbo = $("plTurbo") && !$("plTurbo").disabled && $("plTurbo").checked;
+    const href = "/api/download?url=" + encodeURIComponent(e.url) + "&kind=" + encodeURIComponent(f.kind) + (turbo ? "&turbo=1" : "") + codecQS() + keyQS();
+    st.textContent = turbo ? "preparing…" : "0 MB";
+    let lastGot = 0;
+    const n = await saveStream(href, safeName(d.title) + "." + (turbo ? "mp4" : f.ext),
+      got => {
+        st.textContent = dl.paused ? "paused" : mb(got);
+        if (agg) {
+          agg.bytes += got - lastGot; lastGot = got;
+          agg.active.set(row, f.filesize ? Math.min(1, got / f.filesize) : 0);
+          aggTick();
+        }
+      }, dl, turbo ? 600000 : undefined);
+    st.textContent = n === -1 ? "sent ✓" : "done";
+    row.className = "plrow done";
+    if (agg) { agg.active.delete(row); agg.done++; aggTick(); }
+  } catch (ex) {
+    if (agg) agg.active.delete(row);
+    if (ex.name === "AbortError") {  // cancelled by user
+      st.textContent = "cancelled"; row.className = "plrow na";
+    } else {
+      // auto-retry ONCE for transient stalls/drops — never for real 0-byte failures
+      const transient = /retry|stalled|dropped/i.test(ex.message) && !/0 bytes/.test(ex.message);
+      if (transient && attempt < 2 && !batchCancelled) { activeDls.delete(dl); row._dl = null; return grabOne(row, pref, attempt + 1); }
+      st.textContent = "error ↻"; row.className = "plrow err";
+      row.title = ex.message + " — click to retry";
+      row.style.cursor = "pointer";
+      row.onclick = ev => { if (ev.target.className !== "plsel") grabOne(row, $("plq").value); };
+    }
+  } finally {
+    activeDls.delete(dl); row._dl = null;
+  }
+}
+
+$("plpause").onclick = () => {
+  batchPaused = !batchPaused;
+  activeDls.forEach(dl => batchPaused ? dl.pause() : dl.resume());
+  $("plpause").textContent = batchPaused ? "▶ Resume all" : "⏸ Pause all";
+};
+$("plcancel").onclick = () => {
+  batchCancelled = true;
+  activeDls.forEach(dl => dl.cancel());
+};
+
+$("plgo").onclick = async () => {
+  const pref = $("plq").value;
+  store("YoinkT-quality", pref);  // settings memory
+  const queue = [...document.querySelectorAll(".plrow")]
+    .filter(r => r.querySelector(".plsel").checked);
+  if (!queue.length) return;
+  const lanes = Math.min(+($("pllanes")?.value || 1), serverMax);
+  store("YoinkT-lanes", lanes);
+  batchPaused = false; batchCancelled = false;
+  jsInfoCache = new Map();  // fresh per run (stream URLs expire)
+  $("plpause").textContent = "⏸ Pause all";
+  $("plgo").disabled = true;
+  agg = { done: 0, total: queue.length, bytes: 0, t0: performance.now(), active: new Map() };
+  $("plprog").style.display = "block"; aggTick();
+  const urlOf = r => plEntries[+r.dataset.i].url;
+  // prime the first `lanes` infos so lanes start downloading immediately
+  queue.slice(0, lanes).forEach(r => getInfo(urlOf(r)).catch(() => {}));
+  let idx = 0;
+  const worker = async () => {
+    while (idx < queue.length && !batchCancelled) {
+      const my = idx++;
+      if (idx < queue.length) getInfo(urlOf(queue[idx])).catch(() => {});  // prefetch next
+      await grabOne(queue[my], pref);
+    }
+  };
+  await Promise.all(Array.from({length: lanes}, worker));
+  agg = null;
+  $("plprogtxt").textContent = batchCancelled ? "Cancelled" : "All done ✓";
+  $("plprogeta").textContent = "";
+  $("plgo").disabled = false;
+};
+
+const route = u => /\/playlist\?/.test(u) ? loadPlaylist(u) : fetchInfo(u);
+$("f").addEventListener("submit", e => { e.preventDefault(); const u=$("url").value.trim(); if(u) route(u); });
+document.addEventListener("paste", e => {
+  const t = e.clipboardData?.getData("text").trim() || "";
+  if (/^https?:\/\/(www\.|m\.|music\.)?(youtube\.com|youtu\.be|youtubekids\.com)\//i.test(t) ||
+      /^https?:\/\/(www\.|mobile\.)?(x\.com|twitter\.com)\/\w+\/status\/\d+/i.test(t) ||
+      /^https?:\/\/((www|m|web)\.)?facebook\.com\/(watch|reel\/|share\/[vrp]\/|video\.php|photo|permalink\.php|story\.php|[\w.]+\/(videos|posts|photos)\/)/i.test(t) ||
+      /^https?:\/\/fb\.watch\//i.test(t) ||
+      /^https?:\/\/(www\.)?instagram\.com\/([\w.]+\/)?(p|reel|reels|tv)\//i.test(t) ||
+      /^https?:\/\/((www|m)\.)?tiktok\.com\/(@[\w.]+\/(video|photo)\/|t\/)/i.test(t) ||
+      /^https?:\/\/(vm|vt)\.tiktok\.com\//i.test(t)) {
+    $("url").value = t; route(t); e.preventDefault();
+  }
+});
+</script>
+</body>
+</html>

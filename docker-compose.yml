@@ -1,0 +1,37 @@
+services:
+  YoinkT:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # PROXY_URL: "http://user:pass@residential-proxy:port"   # only needed on datacenter IPs
+      # COOKIES_FILE: "/secrets/cookies.txt"        # global fallback
+      # COOKIES_FILE_X: "/secrets/cookies-x.txt"    # X only (NSFW/protected posts; X sessions expire in days)
+      # COOKIES_FILE_FACEBOOK: "/secrets/cookies-fb.txt"   # private/group videos
+      # COOKIES_FILE_INSTAGRAM: "/secrets/cookies-ig.txt"  # IG needs this for nearly everything (photos esp.)
+      # COOKIES_FILE_TIKTOK: "/secrets/cookies-tt.txt"     # rarely needed; anon works
+      # COOKIES_FILE_YOUTUBE: "/secrets/cookies-yt.txt"
+      # ENABLED_SITES: "youtube,x,facebook,instagram,tiktok"  # site allowlist
+      MAX_CONCURRENCY: "6"        # simultaneous downloads (playlist lanes cap). Should be >= lanes you pick,
+                                  # else extra downloads park at "0 B · Starting" waiting for a slot.
+      CONCURRENT_FRAGMENTS: "16"  # parallel chunks WITHIN one video. Only helps if the format is fragmented.
+      # STREAM_STALL_TIMEOUT: "120"  # seconds of no data before a hung stream is killed + slot freed.
+      # --- full-speed / anti-throttle (PO tokens) — ENABLED by default ---
+      # Routes through the bgutil-provider sidecar below: yt-dlp looks like a
+      # real first-party client -> YouTube serves full-speed googlevideo
+      # servers instead of the throttled per-connection cap. Deno (in the image)
+      # solves the n-challenge. This is the main lever past the ~2-4 MB/s wall.
+      POT_PROVIDER_URL: "http://bgutil-provider:4416"
+      # PO_TOKEN: "web.gvs+XXXX"   # or a static token instead of the provider
+    # volumes:
+    #   - ./cookies.txt:/secrets/cookies.txt:ro
+    depends_on:
+      - bgutil-provider
+    restart: unless-stopped
+
+  # PO-token provider — mints proof-of-origin tokens so YouTube serves full
+  # speed. YoinkT reaches it on the internal network at bgutil-provider:4416.
+  bgutil-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    restart: unless-stopped
+    # no host ports needed — internal network only

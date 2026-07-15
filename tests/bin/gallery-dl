@@ -1,0 +1,4 @@
+#!/bin/sh
+cat <<'EOF'
+[[1, {"category": "twitter"}], [2, {"dir": "x"}], [3, "https://pbs.twimg.com/media/AAA?format=jpg&name=orig", {"extension": "jpg"}], [3, "https://pbs.twimg.com/media/BBB?format=png&name=orig", {"extension": "png"}], [3, "https://video.twimg.com/vid.mp4", {"extension": "mp4"}]]
+EOF
