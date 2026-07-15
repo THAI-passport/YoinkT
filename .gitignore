@@ -1,0 +1,23 @@
+# Node/Frontend
+node_modules/
+dist/
+.DS_Store
+
+# Python/Backend
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.env
+
+# Logs and local artifacts
+*.log
+yt-grab.log
+YoinkT.log
+cookies.txt
