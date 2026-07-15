@@ -101,6 +101,7 @@ with open("bin/gallery-dl", "w") as f:
     f.write("#!/bin/sh\ncat <<'EOF'\n" + json.dumps(msgs) + "\nEOF\n")
 os.chmod("bin/gallery-dl", 0o755)
 os.environ["PATH"] = os.path.abspath("bin") + ":" + os.environ["PATH"]
+app._gdl_cmd = lambda: ["gallery-dl"]
 photos = app._gdl_photos("https://x.com/u/status/1")
 check("gdl: 2 photos, mp4 filtered", [p["ext"] for p in photos] == ["jpg", "png"])
 
