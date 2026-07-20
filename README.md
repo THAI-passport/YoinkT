@@ -37,15 +37,9 @@ pip install -r requirements.txt
 uvicorn app:app --reload
 ```
 
-## 🌐 Deploying Frontend to GitHub Pages (gh-pages)
+### Quick Start Script
 
-You **can** host the UI on GitHub Pages! However, because YoinkT requires a backend to fetch and stream the videos, you will need to host the backend separately (e.g., on Render, Railway, Fly.io, or your own server).
-
-### Steps to host on gh-pages:
-1. Deploy your backend to a public server (e.g., `https://api.yourdomain.com`).
-2. Ensure your backend has **CORS enabled** so your GitHub Pages domain can talk to it.
-3. Update the frontend API calls in `backend/static/index.html` (or in the React `frontend/` source) to point to your new backend URL instead of relative paths (change `/api/...` to `https://api.yourdomain.com/api/...`).
-4. Commit the `index.html` (and assets) to a `gh-pages` branch on your GitHub repository!
+`./run-local.sh [youtube-url]` verifies the source, stops any stale server, starts the app (Docker if available, else native Python), and runs a self-test — optionally including a real download test if you pass a URL.
 
 ## ☸️ Kubernetes Deployment
 
@@ -81,6 +75,17 @@ There is also a React + TypeScript version in `frontend/`. To build and replace 
 cd frontend
 npm install && npm run build
 cp -r dist/* ../backend/static/
+```
+
+## 🧪 Testing
+
+Tests live in `tests/`:
+- `test_x_offline.py` — offline unit tests, no network required.
+- `smoke_live.py` — live smoke test against real sites (requires network access).
+
+```bash
+cd backend && pip install -r requirements.txt
+pytest ../tests/test_x_offline.py
 ```
 
 ## ⚠️ Legal & Maintenance

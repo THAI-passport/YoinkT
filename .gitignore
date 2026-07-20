@@ -21,3 +21,27 @@ pip-delete-this-directory.txt
 yt-grab.log
 YoinkT.log
 cookies.txt
+
+# AI & LLM Assistants
+.claude/
+.claude.json
+claude.json
+.claudeconfig
+.gemini/
+.cursor/
+.cursorrules
+.cursorignore
+.cursorindexing
+.cline/
+.clinerules
+.roo/
+.roomodes
+.windsurf/
+.windsurfrules
+.copilot/
+.continue/
+.aider*
+.aichat/
+*.prompt
+*.prompts
+
