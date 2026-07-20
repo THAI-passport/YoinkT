@@ -1,5 +1,9 @@
 # YoinkT 🎬⬇️
 
+<p align="center">
+  <img src="image/logo.png" alt="YoinkT Logo" width="350" />
+</p>
+
 > **Grab it and go!** A stateless, streaming media download service for YouTube, X, Facebook, Instagram, and TikTok.
 
 YoinkT allows you to paste a URL and instantly stream video or audio in the resolution you choose. **Nothing touches the disk** — media is piped straight through the server to the client. This means zero storage costs and easy horizontal scaling!
