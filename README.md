@@ -53,6 +53,41 @@ docker build -t <registry>/YoinkT:1 . && docker push <registry>/YoinkT:1
 kubectl apply -f k8s/
 ```
 
+### Stealth profiles
+
+Some platforms fingerprint the **TLS handshake**, not just the User-Agent — a stock Python HTTPS client is identifiable as "not a browser" before any HTTP is sent, and gets checkpointed no matter how good your cookies are. YoinkT ships browser-grade handshakes, on by default for X / Facebook / Instagram / TikTok and deliberately **off for YouTube** (PO tokens are YouTube's lever there, and a mismatched handshake can lose you the full-speed formats).
+
+```bash
+STEALTH_PROFILES="x=chrome,instagram=safari"   # override per site
+STEALTH_PROFILES=off                           # disable entirely
+```
+
+If a request is refused with a client-level block ("confirm you're not a bot", "rate-limit reached", checkpoint), YoinkT retries it **once** with a profile before giving up. The transport is an optional dependency: if it isn't installed, everything falls back to the stock client rather than erroring. `GET /api/health` reports what's actually active per site.
+
+### Engine freshness
+
+The extraction engine rots — platforms change their internals and a build from last month stops working. It's the single most common cause of "it worked yesterday".
+
+The image **pins its engine build on purpose.** Freshness only pays off when extraction actually breaks, whereas every engine bump is a throughput risk — this project has already lost half its 1080p speed once to an engine-side client change. So moving forward is a decision, not a default:
+
+```bash
+docker build .                                      # pinned (default)
+docker build --build-arg ENGINE_VERSION=2026.8.1 .  # a specific build
+docker build --build-arg ENGINE_VERSION="" .        # latest, incl. same-day builds
+```
+
+What earns the right to pin is the rest of the setup:
+
+- **CI runs a weekly nightly canary** — the same test suite against the newest engine build. It never gates the build; a red canary means "look before you bump".
+- **`GET /api/health` reports the shipped build**, its age in days, and a `stale` flag past `ENGINE_STALE_DAYS` (default 21). Reporting only, nothing is blocked.
+
+```bash
+curl -s localhost:8000/api/health | python -m json.tool
+# "engine": {"version": "2026.7.4", "age_days": 16, "stale": false, "channel": "stable", ...}
+```
+
+When extraction starts failing on a site, that's the signal to bump the pin — not the calendar.
+
 **Bot-Blocking Note**: Datacenter IPs are often blocked by YouTube. To fix this, you can configure either:
 - **`PROXY_URL`**: Route traffic through a residential proxy.
 - **`COOKIES_FILE`**: Mount a `cookies.txt` (from a logged-in browser) as a Kubernetes Secret:

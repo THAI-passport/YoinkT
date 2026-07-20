@@ -1,6 +1,16 @@
 fastapi>=0.115
 uvicorn[standard]>=0.30
+# Extraction engine. The floor below is a floor, NOT a target — the Docker
+# image deliberately upgrades past it to a same-day build (see Dockerfile), and
+# CI rebuilds weekly. Platforms change their internals constantly; an engine
+# that is merely "recent enough to install" is already the top failure cause.
+# /api/health reports the resolved build and flags it once it goes stale.
 yt-dlp>=2026.7.4
+# Browser-grade TLS handshake for the stealth profiles (STEALTH_PROFILES).
+# Social platforms fingerprint the handshake itself, so a stock Python client
+# is identifiable before any HTTP is sent. OPTIONAL: absence is feature-
+# detected at runtime and downgrades to the stock client, never an error.
+curl-cffi>=0.7
 # PO-token provider plugin (talks to a bgutil provider for full-speed formats).
 # Harmless when no provider is configured — yt-dlp just ignores it.
 bgutil-ytdlp-pot-provider>=1.1.0

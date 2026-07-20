@@ -1,8 +1,14 @@
 name: build
 
-# Weekly rebuild is the #1 maintenance lever: a stale yt-dlp breaks extraction
-# whenever a platform changes internals. This picks up the latest yt-dlp,
-# runs the offline test suite, and (on main) builds + pushes the image.
+# Two separate questions, two separate jobs:
+#
+#   "does what we SHIP still work?"  -> test / smoke / image, all on ENGINE_VERSION
+#   "will the NEXT engine break us?" -> engine-canary, on the newest build
+#
+# The image pins its engine on purpose (see Dockerfile). The canary is what
+# earns the right to do that: it runs the same suite against the newest build
+# weekly, so an upgrade becomes a decision made on evidence rather than a
+# default that silently changes download behavior.
 on:
   schedule:
     - cron: "0 6 * * 1"   # Mondays 06:00 UTC
@@ -11,19 +17,25 @@ on:
   pull_request:
   workflow_dispatch:
 
+env:
+  # Keep in sync with the Dockerfile ARG of the same name.
+  ENGINE_VERSION: "2026.07.04"
+
 jobs:
   test:
+    # Tests the engine build the image actually ships.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install deps (latest yt-dlp + gallery-dl)
+      - name: Install deps (pinned engine — matches the image)
         run: |
           python -m pip install --upgrade pip
           pip install -r backend/requirements.txt
-          pip install --upgrade yt-dlp gallery-dl
+          pip install "yt-dlp==${ENGINE_VERSION}"
+          pip install --upgrade gallery-dl
       - name: Offline test suite
         run: python tests/test_x_offline.py
       - name: Syntax check UI
@@ -37,6 +49,29 @@ jobs:
           import sys; sys.exit(subprocess.run(["node","--check","/tmp/ui.js"]).returncode)
           PY
 
+  engine-canary:
+    # Early warning only — never gates the build. A red canary means "the next
+    # engine bump needs attention before you take it", not "main is broken".
+    # If this fails, read the diff between ENGINE_VERSION and the build below
+    # before touching the pin.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install deps (newest engine, incl. same-day builds)
+        run: |
+          pip install -r backend/requirements.txt
+          pip install --pre --upgrade yt-dlp
+          pip install --upgrade gallery-dl
+      - name: Report engine delta
+        run: |
+          echo "pinned : ${ENGINE_VERSION}"
+          python -c "import yt_dlp.version as v; print('canary :', v.__version__)"
+      - name: Offline test suite
+        run: python tests/test_x_offline.py
+
   smoke:
     # live per-site check; network to social sites may be blocked on CI runners,
     # so it's allowed to fail (informational). Run locally for a real signal.
@@ -49,7 +84,8 @@ jobs:
         with: { python-version: "3.12" }
       - run: |
           pip install -r backend/requirements.txt
-          pip install --upgrade yt-dlp gallery-dl
+          pip install "yt-dlp==${ENGINE_VERSION}"
+          pip install --upgrade gallery-dl
           sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Start server + smoke
         run: |
@@ -64,4 +100,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build image (no push by default — add registry login + push here)
-        run: docker build -t yoink:latest .
+        run: docker build --build-arg ENGINE_VERSION="${ENGINE_VERSION}" -t yoink:latest .

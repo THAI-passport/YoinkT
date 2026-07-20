@@ -1,6 +1,12 @@
 services:
   YoinkT:
-    build: .
+    build:
+      context: .
+      args:
+        # Engine build. run-local.sh exports this from ./ENGINE_VERSION so both
+        # run modes get the same engine; a bare `docker compose build` falls
+        # back to the Dockerfile ARG default, which is the same value.
+        ENGINE_VERSION: "${ENGINE_VERSION:-2026.07.04}"
     ports:
       - "8000:8000"
     environment:

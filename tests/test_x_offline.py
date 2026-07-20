@@ -301,5 +301,88 @@ check("social name fallback", nm2.startswith("tiktok_") and _t.strftime("%Y-%m-%
 check("social name id-only ok", app._social_name("x", {"id": "999"}).startswith("x_999_"))
 
 check("version current", app.APP_VERSION.startswith("YoinkT v") and "always-mp4" in app.APP_VERSION)
+
+# ---- v39: config isolation, stealth profiles, engine provenance ----
+
+# config isolation must be present on EVERY subprocess path, and first —
+# a later flag can't undo an ambient config that was already merged.
+for _site in ("youtube", "x", "instagram"):
+    bf = app._base_flags(_site)
+    check(f"config isolated ({_site})",
+          bf[0] == "--ignore-config" and "--no-config-locations" in bf)
+    check(f"config isolation survives _common_flags ({_site})",
+          "--ignore-config" in app._common_flags(_site))
+
+# stealth profile policy: social sites armed, youtube deliberately not
+check("stealth default youtube off", app._STEALTH_DEFAULTS["youtube"] is None)
+check("stealth default social on",
+      all(app._STEALTH_DEFAULTS[s] for s in ("x", "facebook", "instagram", "tiktok")))
+check("stealth env off kills all",
+      all(v is None for v in app._parse_stealth("off").values()))
+check("stealth env override", app._parse_stealth("x=safari")["x"] == "safari")
+check("stealth env override leaves others at default",
+      app._parse_stealth("x=safari")["instagram"] == app._STEALTH_DEFAULTS["instagram"])
+check("stealth env ignores unknown site", "bogus" not in app._parse_stealth("bogus=chrome"))
+
+# transport is optional: with it absent, no flag is emitted anywhere
+check("stealth availability is bool", isinstance(app._stealth_available(), bool))
+if not app._stealth_available():
+    check("no stealth flag when transport missing",
+          all("--impersonate" not in app._base_flags(s) for s in app._STEALTH_DEFAULTS))
+    check("no impersonate opt when transport missing",
+          "impersonate" not in app._ydl_opts("x"))
+    check("_stealth_for returns None when transport missing",
+          app._stealth_for("x") is None)
+
+# block detection drives the one-shot stealth retry — narrow on purpose
+check("block err: bot wall", app._is_block_error(Exception("Sign in to confirm you're not a bot")))
+check("block err: rate limit", app._is_block_error(Exception("rate-limit reached")))
+check("block err: checkpoint", app._is_block_error(Exception("Checkpoint required")))
+check("block err: private post is NOT a block",
+      not app._is_block_error(Exception("This post is private; login required")))
+check("block err: plain 404 is NOT a block",
+      not app._is_block_error(Exception("HTTP Error 404: Not Found")))
+
+# engine provenance never raises, even with the engine absent (sandbox case)
+_eng = app._engine_info()
+check("engine info is dict", isinstance(_eng, dict))
+check("engine info has keys",
+      {"version", "age_days", "stale", "channel"} <= set(_eng))
+check("engine stale threshold sane", app.ENGINE_STALE_DAYS > 0)
+
+# photo-resolver config flag is probed, not guessed
+check("gdl config flag is list", isinstance(app._gdl_config_flag(), list))
+check("gdl config flag empty or known",
+      app._gdl_config_flag() in ([], ["--ignore-config"], ["--config-ignore"]))
+
+check("version v39", "v39" in app.APP_VERSION and "always-mp4" in app.APP_VERSION)
+
+
+# ---- v39: engine pin must not drift across the four places it appears ----
+# ./ENGINE_VERSION is the source of truth. Dockerfile ARG default and the CI
+# env are fallbacks for when run-local.sh isn't the entry point, so they have
+# to agree or Docker and native silently run different engines — exactly the
+# floating variable that makes a speed regression impossible to attribute.
+import re as _re, pathlib as _pl
+_root = _pl.Path(__file__).resolve().parent.parent
+_pin = (_root / "ENGINE_VERSION").read_text().strip()
+check("ENGINE_VERSION file looks like a build", bool(_re.fullmatch(r"\d{4}\.\d{1,2}\.\d{1,2}(\.\d+)?", _pin)))
+
+_df = _re.search(r"ARG ENGINE_VERSION=(\S*)", (_root / "Dockerfile").read_text())
+check("Dockerfile pin matches ENGINE_VERSION", _df and _df.group(1).strip('"') == _pin)
+
+_ci = _re.search(r'ENGINE_VERSION:\s*"([^"]*)"', (_root / ".github/workflows/build.yml").read_text())
+check("CI pin matches ENGINE_VERSION", _ci and _ci.group(1) == _pin)
+
+_compose = (_root / "docker-compose.yml").read_text()
+_cp = _re.search(r"ENGINE_VERSION:\s*\"\$\{ENGINE_VERSION:-([^}]*)\}\"", _compose)
+check("compose fallback matches ENGINE_VERSION", _cp and _cp.group(1) == _pin)
+
+_rl = (_root / "run-local.sh").read_text()
+check("run-local reads the pin file", "< ENGINE_VERSION" in _rl)
+_rl_code = "\n".join(l for l in _rl.splitlines() if not l.strip().startswith("#"))
+check("run-local no longer blind-upgrades the engine",
+      "--upgrade yt-dlp" not in _rl_code.replace("--pre --upgrade yt-dlp", ""))
+
 print(f"\nTOTAL {ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)

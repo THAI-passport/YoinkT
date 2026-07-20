@@ -33,9 +33,20 @@ Config (env):
                      degrade the others. Site-specific beats global when both set.
   ENABLED_SITES      comma list, default "youtube,x,facebook,instagram"
   MAX_CONCURRENCY    simultaneous downloads per pod (default 6)
+  STEALTH_PROFILES   per-site browser handshake, e.g. "x=chrome,instagram=safari";
+                     "off" disables. Default: on for the social sites, OFF for
+                     YouTube (PO tokens are YouTube's lever; a mismatched
+                     handshake there can cost the full-speed formats). Needs the
+                     optional curl-cffi transport — absence is detected and
+                     silently downgrades to the stock client.
+  ENGINE_STALE_DAYS  age past which /api/health flags the extraction engine as
+                     stale (default 21). Reporting only; nothing is blocked.
 """
 
 import asyncio
+import datetime
+import functools
+import importlib
 import importlib.util
 import logging
 import os
@@ -53,7 +64,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-APP_VERSION = "YoinkT v38-always-mp4-multi"  # bump on behavior changes; shown in UI footer
+APP_VERSION = "YoinkT v39-always-mp4-stealth"  # bump on behavior changes; shown in UI footer
 # NOTE: keep the substring "always-mp4" — run-local.sh greps for it
 
 PROXY_URL = os.environ.get("PROXY_URL") or None
@@ -97,6 +108,35 @@ CONCURRENT_FRAGMENTS = int(os.environ.get("CONCURRENT_FRAGMENTS", "16"))
 # plain https, where concurrent-fragments does nothing) — this is the throttle
 # dodge for them. Set "0" to disable if CDN starts 403ing ranged requests.
 HTTP_CHUNK_SIZE = os.environ.get("HTTP_CHUNK_SIZE", "10M")
+
+# ---- stealth profiles -------------------------------------------------------
+# Some platforms fingerprint the TLS handshake, not just the User-Agent: a
+# stock Python HTTPS client is identifiable as "not a browser" before a single
+# byte of HTTP is sent, and gets checkpointed regardless of cookies. A stealth
+# profile makes the extractor's requests handshake like a real browser build.
+#
+# Deliberately NOT enabled for youtube: PO tokens (above) are YouTube's real
+# lever, and a mismatched handshake there can cost us the full-speed formats.
+# The social sites are where the TLS check actually bites.
+#
+# Override wholesale with STEALTH_PROFILES="x=chrome,instagram=safari" or
+# disable entirely with STEALTH_PROFILES="off".
+_STEALTH_DEFAULTS = {
+    "youtube": None,
+    "x": "chrome",
+    "facebook": "chrome",
+    "instagram": "chrome",
+    "tiktok": "chrome",
+}
+STREAM_PROFILE_RAW = os.environ.get("STEALTH_PROFILES", "")
+
+# ---- engine provenance ------------------------------------------------------
+# The extraction engine is the part of YoinkT that rots: platforms change their
+# internals and an engine built last month stops working. We can't stop that,
+# but we can make it VISIBLE instead of showing up as mystery 502s — health
+# reports the engine build and flags it once it's older than this many days.
+ENGINE_STALE_DAYS = int(os.environ.get("ENGINE_STALE_DAYS", "21"))
+
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
 app = FastAPI(title="YoinkT", docs_url=None, redoc_url=None)
@@ -195,6 +235,89 @@ def _cookies_for(site: str) -> str | None:
     return SITE_COOKIES_RUNTIME.get(site) or SITE_COOKIES.get(site) or COOKIES_FILE
 
 
+# ---- stealth profiles -------------------------------------------------------
+
+def _parse_stealth(raw: str) -> dict[str, str | None]:
+    """STEALTH_PROFILES env -> {site: profile|None}. "off" disables everything."""
+    if raw.strip().lower() in ("off", "none", "0", "false"):
+        return {s: None for s in _STEALTH_DEFAULTS}
+    out = dict(_STEALTH_DEFAULTS)
+    for pair in raw.split(","):
+        if "=" not in pair:
+            continue
+        site, _, prof = pair.partition("=")
+        site, prof = site.strip().lower(), prof.strip()
+        if site in out:
+            out[site] = prof or None
+    return out
+
+
+STEALTH_PROFILES = _parse_stealth(STREAM_PROFILE_RAW)
+
+
+@functools.lru_cache(maxsize=1)
+def _stealth_available() -> bool:
+    """Whether browser-handshake requests are actually possible in this build.
+
+    Feature-detected, never assumed: the transport is an OPTIONAL dependency
+    (see requirements.txt). If it's missing — slim image, pip resolution failure
+    on an exotic arch — every request silently falls back to the stock client
+    rather than erroring. Degraded, not broken."""
+    if importlib.util.find_spec("curl_cffi") is None:
+        return False
+    try:
+        importlib.import_module("yt_dlp.networking.impersonate")
+        return True
+    except Exception:
+        return False
+
+
+def _stealth_for(site: str) -> str | None:
+    prof = STEALTH_PROFILES.get(site)
+    return prof if (prof and _stealth_available()) else None
+
+
+def _stealth_target(profile: str):
+    """Profile string -> the engine's target object (Python API paths only)."""
+    from yt_dlp.networking.impersonate import ImpersonateTarget
+    return ImpersonateTarget.from_str(profile)
+
+
+# ---- engine provenance ------------------------------------------------------
+
+_ENGINE_DATE_RE = re.compile(r"^(\d{4})\.(\d{2})\.(\d{2})")
+
+
+@functools.lru_cache(maxsize=1)
+def _engine_info() -> dict:
+    """Build stamp of the extraction engine + how stale it is.
+
+    Engine builds are date-versioned (YYYY.MM.DD[.nnnnnn]), so age is readable
+    straight off the version string — no network call, no release-feed polling.
+    Cached: this is fixed for the life of the process."""
+    info: dict = {"version": None, "age_days": None, "stale": None,
+                  "channel": None, "photos": None}
+    try:
+        from yt_dlp.version import __version__ as ver
+        info["version"] = ver
+        # 4th segment = nightly/master build counter; plain 3 segments = stable
+        info["channel"] = "nightly" if ver.count(".") >= 3 else "stable"
+        m = _ENGINE_DATE_RE.match(ver)
+        if m:
+            built = datetime.date(*(int(x) for x in m.groups()))
+            age = (datetime.date.today() - built).days
+            info["age_days"] = age
+            info["stale"] = age > ENGINE_STALE_DAYS
+    except Exception as e:  # engine import must never take health down
+        log.warning("engine version probe failed: %s", e)
+    try:
+        from gallery_dl.version import __version__ as gver
+        info["photos"] = gver
+    except Exception:
+        pass
+    return info
+
+
 _POT_ON = bool(PO_TOKEN or POT_PROVIDER_URL)
 
 
@@ -245,6 +368,13 @@ def _ydl_opts(site: str = "youtube") -> dict:
     ea = _extractor_args_dict()  # namespaced per-extractor; harmless off-youtube
     if ea:
         opts["extractor_args"] = ea
+    prof = _stealth_for(site)
+    if prof:
+        with suppress(Exception):  # bad profile name must not kill extraction
+            opts["impersonate"] = _stealth_target(prof)
+    # NB: no config-isolation flag needed here. This path drives the engine
+    # through its Python API, which takes options ONLY from this dict — user
+    # config files are a CLI-layer concern (see _base_flags).
     return opts
 
 
@@ -261,6 +391,22 @@ def _is_age_error(e: Exception) -> bool:
     m = str(e).lower()
     return ("confirm your age" in m or "inappropriate for some users" in m
             or "age-restricted" in m or "confirm you’re" in m and "age" in m)
+
+
+# Phrases the social platforms use when they've decided the CLIENT is the
+# problem rather than the content — i.e. exactly the case a browser handshake
+# can fix. Kept narrow on purpose: "login required" on a genuinely private post
+# is NOT here, because retrying that just burns a request.
+_BLOCK_HINTS = (
+    "not a bot", "confirm you're not", "confirm you’re not",
+    "rate-limit reached", "rate limit reached", "please wait a few minutes",
+    "blocked", "captcha", "checkpoint", "temporarily restricted",
+)
+
+
+def _is_block_error(e: Exception) -> bool:
+    m = str(e).lower()
+    return any(h in m for h in _BLOCK_HINTS)
 
 
 def _extract(url: str) -> dict:
@@ -281,6 +427,19 @@ def _extract(url: str) -> dict:
             opts2 = {**opts, "extractor_args": {**ea, "youtube": yt}}
             with yt_dlp.YoutubeDL(opts2) as ydl:
                 return ydl.extract_info(url, download=False)
+        # Client-level block on a site we did NOT pre-arm with a stealth
+        # profile: retry once with one. Cheap (a second handshake), bounded
+        # (only on the narrow phrase list above), and it turns the most common
+        # social-site failure from a dead 502 into a success. Never loops —
+        # `not opts.get("impersonate")` means a stealth attempt can't retry.
+        if (_is_block_error(e) and _stealth_available()
+                and not opts.get("impersonate")):
+            fallback = STEALTH_PROFILES.get(site) or "chrome"
+            log.info("client-level block on %s; retrying as %s", site, fallback)
+            with suppress(Exception):
+                opts3 = {**opts, "impersonate": _stealth_target(fallback)}
+                with yt_dlp.YoutubeDL(opts3) as ydl:
+                    return ydl.extract_info(url, download=False)
         raise
 
 
@@ -499,11 +658,32 @@ def _gdl_cmd() -> list[str]:
     return ["gallery-dl"]
 
 
+@functools.lru_cache(maxsize=1)
+def _gdl_config_flag() -> list[str]:
+    """Config-isolation flag for the photo resolver, if this build has one.
+
+    Same reasoning as _base_flags: ambient config files must not reach a
+    server process. Probed against --help rather than hardcoded, because the
+    flag's spelling has moved between releases and guessing wrong would abort
+    every photo resolution with a usage error — the failure mode we're trying
+    to prevent. No match -> no flag, and photo resolution works as before."""
+    try:
+        out = subprocess.run(_gdl_cmd() + ["--help"], capture_output=True,
+                             text=True, timeout=15).stdout
+    except Exception as e:
+        log.warning("photo resolver help probe failed: %s", e)
+        return []
+    for flag in ("--ignore-config", "--config-ignore"):
+        if flag in out:
+            return [flag]
+    return []
+
+
 def _gdl_photos(url: str, site: str = "x") -> list[dict]:
     """Resolve post photos via gallery-dl -j. Returns [{url, ext}]."""
     if not _gdl_available():
         return []
-    cmd = _gdl_cmd() + ["-j"]
+    cmd = _gdl_cmd() + ["-j"] + _gdl_config_flag()
     if site in _GDL_NOVIDEO:
         cmd += ["-o", _GDL_NOVIDEO[site]]
     if PROXY_URL:
@@ -865,13 +1045,22 @@ def _ffmeta_chapters(chapters: list[dict]) -> str:
 
 @app.get("/api/health")
 async def health():
+    eng = _engine_info()
     return {"ok": True, "version": APP_VERSION,
             "max_concurrency": MAX_CONCURRENCY,
             "turbo": bool(shutil.which("aria2c")),
             "js_runtime": bool(shutil.which("deno") or shutil.which("node")),
             "pot": bool(PO_TOKEN or POT_PROVIDER_URL),
             "proxy": bool(PROXY_URL), "cookies": bool(COOKIES_FILE),
-            "sites": {s: {"cookies": bool(_cookies_for(s))}
+            # engine build + how old it is. A stale engine is the single most
+            # common cause of "it worked yesterday" — surface it here so it's
+            # one curl away instead of a guess.
+            "engine": eng,
+            "stealth": {"available": _stealth_available(),
+                        "profiles": {s: _stealth_for(s)
+                                     for s in sorted(ENABLED_SITES & SITE_RES.keys())}},
+            "sites": {s: {"cookies": bool(_cookies_for(s)),
+                          "stealth": _stealth_for(s)}
                       for s in sorted(ENABLED_SITES & SITE_RES.keys())},
             "gallery_dl": _gdl_available(),
             "api_key": bool(API_KEY), "rate_limit": RATE_LIMIT_RPM,
@@ -1078,12 +1267,22 @@ async def _stream_proc(cmd: list[str], media_type: str, filename: str):
 
 
 def _base_flags(site: str = "youtube") -> list[str]:
-    flags = ["--no-playlist", "--quiet", "--remote-components", "ejs:github"]
+    # Config isolation comes FIRST and is not optional. The engine binary
+    # otherwise merges settings from several system/user config paths, so a
+    # stray file on the host — or in a future base image — silently rewrites
+    # the flags we build here (a --format or --paths override would break the
+    # streaming contract outright). A server must be reproducible: every knob
+    # comes from this function or from env, nothing from ambient files.
+    flags = ["--ignore-config", "--no-config-locations",
+             "--no-playlist", "--quiet", "--remote-components", "ejs:github"]
     if PROXY_URL:
         flags += ["--proxy", PROXY_URL]
     ck = _cookies_for(site)
     if ck:
         flags += ["--cookies", ck]
+    prof = _stealth_for(site)
+    if prof:
+        flags += ["--impersonate", prof]
     flags += _extractor_args_cli()
     return flags
 

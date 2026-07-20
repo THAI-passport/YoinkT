@@ -8,6 +8,17 @@ echo "== 1/5 verify source =="
 grep -q "APP_VERSION" backend/app.py || { echo "FAIL: stale app.py (pre-v6)"; exit 1; }
 echo "source OK ($(grep -o 'v[0-9]*-always-mp4' backend/app.py | head -1))"
 
+# Engine build, single source of truth for BOTH run modes. Native runs used to
+# `pip install --upgrade yt-dlp` on every launch, which meant the engine could
+# change under you between two runs of the same code — the one variable you
+# least want floating while judging download speed. Now native and Docker run
+# the same build, and moving it is an explicit edit to ./ENGINE_VERSION.
+# Override for a one-off: ENGINE_VERSION=2026.8.1 ./run-local.sh
+#             latest:     ENGINE_VERSION=latest    ./run-local.sh
+ENGINE_VERSION="${ENGINE_VERSION:-$(tr -d ' \t\r\n' < ENGINE_VERSION 2>/dev/null || echo latest)}"
+export ENGINE_VERSION
+echo "engine: $ENGINE_VERSION"
+
 echo "== 2/5 stop old server =="
 # kill anything previously serving this app; old processes serve OLD code forever
 pkill -f "uvicorn app:app" 2>/dev/null && echo "killed old uvicorn" || true
@@ -61,7 +72,14 @@ else
   [ -d .venv ] || python3 -m venv .venv
   ./.venv/bin/pip install -q --upgrade pip
   ./.venv/bin/pip install -q -r backend/requirements.txt
-  ./.venv/bin/pip install -q --upgrade yt-dlp     # stale yt-dlp = throttled/broken
+  # Engine build — pinned to ./ENGINE_VERSION so native matches Docker exactly.
+  # (Was `--upgrade yt-dlp`: silently moved the engine on every launch.)
+  if [ "$ENGINE_VERSION" = latest ]; then
+    ./.venv/bin/pip install -q --pre --upgrade yt-dlp
+  else
+    ./.venv/bin/pip install -q "yt-dlp==${ENGINE_VERSION}"
+  fi
+  echo "engine build: $(./.venv/bin/python -c 'import yt_dlp.version as v;print(v.__version__)')"
   # PATH must include venv bin: app.py spawns the yt-dlp CLI by name
   ( cd backend && PATH="$PWD/../.venv/bin:$PATH" \
       nohup ../.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8000 \
