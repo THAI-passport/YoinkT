@@ -41,6 +41,17 @@ Config (env):
                      silently downgrades to the stock client.
   ENGINE_STALE_DAYS  age past which /api/health flags the extraction engine as
                      stale (default 21). Reporting only; nothing is blocked.
+  ALLOW_PRIVATE_EGRESS
+                     "1" lets resolved media URLs point at private/loopback
+                     addresses. OFF by default — the site allowlist guards the
+                     URL a user SUBMITS, this guards the ones we actually open
+                     sockets to (format URLs, CDN URLs, scraped og: tags, and
+                     every redirect hop). Enable only to fetch from a local
+                     test server.
+  ZIP_MAX_PHOTOS / ZIP_MAX_BYTES
+                     carousel-zip caps: how many photos (60) and how many bytes
+                     (256 MiB). The zip is built in RAM, so the byte cap is the
+                     one that bounds memory.
 """
 
 import asyncio
@@ -64,7 +75,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-APP_VERSION = "YoinkT v39-always-mp4-stealth"  # bump on behavior changes; shown in UI footer
+APP_VERSION = "YoinkT v40-always-mp4-egress"  # bump on behavior changes; shown in UI footer
 # NOTE: keep the substring "always-mp4" — run-local.sh greps for it
 
 PROXY_URL = os.environ.get("PROXY_URL") or None
@@ -233,6 +244,110 @@ def _require_youtube(url: str) -> None:
 def _cookies_for(site: str) -> str | None:
     # runtime upload > per-site env > global env
     return SITE_COOKIES_RUNTIME.get(site) or SITE_COOKIES.get(site) or COOKIES_FILE
+
+
+# ---- egress guard -----------------------------------------------------------
+# The site allowlist (SITE_RES) validates the URL the USER submits. It says
+# nothing about the URLs we end up fetching: format URLs from the extractor,
+# CDN URLs from the photo resolver, and og:video/og:image URLs scraped out of
+# page HTML. Those are the ones this process actually opens sockets to, and
+# until now nothing checked them. Two concrete holes that closes:
+#
+#   1. urllib's default opener includes FileHandler/FTPHandler/DataHandler, so
+#      a resolved "file:///etc/passwd" would be read and streamed to the caller.
+#   2. urllib follows redirects by default and revalidates nothing, so a CDN
+#      URL that 302s to 169.254.169.254 (cloud metadata) or 127.0.0.1 would be
+#      followed and its response returned.
+#
+# So: scheme allowlist, destination-IP denylist, and every redirect hop
+# revalidated. Use _egress_opener() instead of urllib.request.build_opener()
+# for anything reachable from a request.
+#
+# HONEST LIMIT: this is a check-then-connect design, so a DNS name that
+# resolves to a public IP here and a private one microseconds later (DNS
+# rebinding) is not covered. Closing that needs connect-time pinning, which
+# urllib doesn't expose. Out of scope for this threat model — the realistic
+# vectors are redirects and scraped URLs, both of which ARE covered.
+ALLOW_PRIVATE_EGRESS = os.environ.get(
+    "ALLOW_PRIVATE_EGRESS", "0") in ("1", "true", "yes")
+
+_EGRESS_SCHEMES = {"http", "https"}
+
+
+def _egress_reject_reason(url: str) -> str | None:
+    """None if this URL is safe to open, else a short reason. Never raises."""
+    import ipaddress
+    import socket
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(url)
+    except Exception:
+        return "unparseable URL"
+    if parts.scheme.lower() not in _EGRESS_SCHEMES:
+        return f"scheme {parts.scheme!r} not allowed"
+    host = parts.hostname
+    if not host:
+        return "no host"
+    if ALLOW_PRIVATE_EGRESS:
+        return None
+    if PROXY_URL:
+        # With an egress proxy the NAME is resolved at the proxy, not here, so
+        # local resolution proves nothing about where the connection lands.
+        # Scheme check still applies; IP checks are the proxy's job.
+        return None
+    try:
+        infos = socket.getaddrinfo(host, parts.port or
+                                   (443 if parts.scheme == "https" else 80),
+                                   proto=socket.IPPROTO_TCP)
+    except Exception as e:
+        return f"cannot resolve host ({type(e).__name__})"
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            return f"unparseable address {addr!r}"
+        # covers loopback, RFC1918, link-local (incl. 169.254 metadata),
+        # unique-local v6, multicast, reserved, and unspecified
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+            return f"resolves to non-public address {addr}"
+    return None
+
+
+def _validate_egress(url: str) -> str:
+    reason = _egress_reject_reason(url)
+    if reason:
+        log.warning("egress blocked: %s (%s)", url[:120], reason)
+        raise HTTPException(502, f"upstream URL rejected: {reason}")
+    return url
+
+
+def _egress_opener(*extra_handlers):
+    """An opener that can ONLY speak http/https and revalidates every redirect.
+
+    Built from an explicit handler list rather than urllib.request.build_opener,
+    because build_opener always mixes in the defaults — including the file://
+    and ftp:// handlers this is meant to exclude."""
+    import urllib.request
+
+    class _GuardedRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            _validate_egress(newurl)  # raises -> redirect chain aborts here
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    od = urllib.request.OpenerDirector()
+    for h in (urllib.request.HTTPHandler(), urllib.request.HTTPSHandler(),
+              urllib.request.HTTPErrorProcessor(),
+              urllib.request.HTTPDefaultErrorHandler(), _GuardedRedirect()):
+        od.add_handler(h)
+    if PROXY_URL:
+        od.add_handler(urllib.request.ProxyHandler(
+            {"http": PROXY_URL, "https": PROXY_URL}))
+    for h in extra_handlers:
+        od.add_handler(h)
+    return od
 
 
 # ---- stealth profiles -------------------------------------------------------
@@ -451,6 +566,11 @@ def _extract(url: str) -> dict:
 _INFO_TTL = int(os.environ.get("INFO_CACHE_TTL", "300"))
 _INFO_CACHE: dict[str, tuple[float, dict]] = {}
 _info_locks: dict[str, asyncio.Lock] = {}
+# How many coroutines are currently inside _extract_cached for a given URL —
+# i.e. holding its lock OR queued for it. Only the last one out may reclaim the
+# lock. See the WHY in _extract_cached's finally block: asyncio.Lock.locked()
+# is NOT sufficient to answer "is anyone still using this?".
+_info_lock_users: dict[str, int] = {}
 
 
 async def _extract_cached(url: str) -> dict:
@@ -458,17 +578,40 @@ async def _extract_cached(url: str) -> dict:
     if hit and time.time() - hit[0] < _INFO_TTL:
         return hit[1]
     lock = _info_locks.setdefault(url, asyncio.Lock())
-    async with lock:
-        hit = _INFO_CACHE.get(url)
-        if hit and time.time() - hit[0] < _INFO_TTL:
-            return hit[1]
-        info = await asyncio.to_thread(_extract, url)
-        _INFO_CACHE[url] = (time.time(), info)
-        if len(_INFO_CACHE) > 256:  # simple LRU-ish cap
-            oldest = min(_INFO_CACHE, key=lambda k: _INFO_CACHE[k][0])
-            _INFO_CACHE.pop(oldest, None)
-            _info_locks.pop(oldest, None)
-        return info
+    _info_lock_users[url] = _info_lock_users.get(url, 0) + 1
+    try:
+        async with lock:
+            hit = _INFO_CACHE.get(url)
+            if hit and time.time() - hit[0] < _INFO_TTL:
+                return hit[1]
+            info = await asyncio.to_thread(_extract, url)
+            _INFO_CACHE[url] = (time.time(), info)
+            if len(_INFO_CACHE) > 256:  # simple LRU-ish cap
+                oldest = min(_INFO_CACHE, key=lambda k: _INFO_CACHE[k][0])
+                _INFO_CACHE.pop(oldest, None)
+                if not _info_lock_users.get(oldest):
+                    _info_locks.pop(oldest, None)
+            return info
+    finally:
+        # Locks were once reclaimed only alongside a CACHE eviction, so a URL
+        # whose extraction FAILED leaked its lock forever — no cache entry was
+        # written, so nothing ever evicted it. A dead site or a client retrying
+        # bad URLs grew this dict without bound.
+        #
+        # WHY A REFCOUNT AND NOT `lock.locked()`: asyncio.Lock.release() clears
+        # _locked BEFORE the next waiter is scheduled, so there is a window
+        # where locked() is False while a waiter is still queued. Popping the
+        # lock there means the next caller setdefault()s a SECOND lock for the
+        # same URL and extracts concurrently with the waiter — precisely the
+        # duplicate-collapse this lock exists to prevent. The refcount counts
+        # holders AND waiters, so only the genuine last one out reclaims.
+        n = _info_lock_users.get(url, 1) - 1
+        if n > 0:
+            _info_lock_users[url] = n
+        else:
+            _info_lock_users.pop(url, None)
+            if url not in _INFO_CACHE:
+                _info_locks.pop(url, None)
 
 
 def _safe_name(title: str) -> str:
@@ -740,22 +883,17 @@ def _og_fetch_html(url: str, site: str) -> str:
             import http.cookiejar
             cj = http.cookiejar.MozillaCookieJar(ck)
             cj.load(ignore_discard=True, ignore_expires=True)
-            opener = urllib.request.build_opener(
-                urllib.request.HTTPCookieProcessor(cj))
-            if PROXY_URL:
-                opener.add_handler(urllib.request.ProxyHandler(
-                    {"http": PROXY_URL, "https": PROXY_URL}))
-            return opener.open(urllib.request.Request(url, headers=headers),
+            opener = _egress_opener(urllib.request.HTTPCookieProcessor(cj))
+            return opener.open(urllib.request.Request(_validate_egress(url),
+                                                      headers=headers),
                                timeout=20).read().decode("utf-8", "replace")
+        except HTTPException:
+            raise  # an egress rejection is a real answer — don't fall through
         except Exception:
             pass
-    handlers = []
-    if PROXY_URL:
-        handlers.append(urllib.request.ProxyHandler(
-            {"http": PROXY_URL, "https": PROXY_URL}))
-    opener = urllib.request.build_opener(*handlers)
-    return opener.open(urllib.request.Request(url, headers=headers),
-                       timeout=20).read().decode("utf-8", "replace")
+    return _egress_opener().open(
+        urllib.request.Request(_validate_egress(url), headers=headers),
+        timeout=20).read().decode("utf-8", "replace")
 
 
 def _unescape_url(u: str) -> str:
@@ -1022,12 +1160,7 @@ def _vtt_to_srt(vtt: str) -> str:
 
 
 def _fetch_url(u: str) -> bytes:
-    import urllib.request
-
-    handlers = []
-    if PROXY_URL:
-        handlers.append(urllib.request.ProxyHandler({"http": PROXY_URL, "https": PROXY_URL}))
-    return urllib.request.build_opener(*handlers).open(u, timeout=30).read()
+    return _egress_opener().open(_validate_egress(u), timeout=30).read()
 
 
 def _ffmeta_chapters(chapters: list[dict]) -> str:
@@ -1442,14 +1575,13 @@ def _range_proxy(direct_url: str, request: Request, filename: str,
     rng = request.headers.get("range")
     if rng:
         req_headers["Range"] = rng
-    handlers = []
-    if PROXY_URL:
-        handlers.append(urllib.request.ProxyHandler(
-            {"http": PROXY_URL, "https": PROXY_URL}))
-    opener = urllib.request.build_opener(*handlers)
+    opener = _egress_opener()
 
     try:
-        r = opener.open(urllib.request.Request(direct_url, headers=req_headers), timeout=30)
+        r = opener.open(urllib.request.Request(_validate_egress(direct_url),
+                                               headers=req_headers), timeout=30)
+    except HTTPException:
+        raise  # egress rejection already carries its own status + reason
     except Exception as e:
         log.error("range proxy failed for %s…: %s", direct_url[:120], e)
         raise HTTPException(502, f"upstream fetch failed: {e}") from e
@@ -1599,27 +1731,51 @@ async def api_download(
         def _build_zip() -> bytes:
             import io, zipfile, urllib.request
             cap = int(os.environ.get("ZIP_MAX_PHOTOS", "60"))
-            handlers = []
-            if PROXY_URL:
-                handlers.append(urllib.request.ProxyHandler(
-                    {"http": PROXY_URL, "https": PROXY_URL}))
-            opener = urllib.request.build_opener(*handlers)
+            # Byte budget, not just a photo count. ZIP_MAX_PHOTOS bounds how
+            # many images we fetch; it says nothing about their SIZE, and this
+            # blob lives in RAM. MAX_CONCURRENCY of these in flight at once is
+            # the actual exposure, so cap the bytes too and stop early rather
+            # than let one carousel of full-resolution images decide how much
+            # memory the process uses.
+            budget = int(os.environ.get("ZIP_MAX_BYTES", str(256 * 1024 * 1024)))
+            opener = _egress_opener()
             buf = io.BytesIO()
             # STORED (no compression): images are already compressed, and stored
-            # entries keep this cheap. Bounded in memory (carousels are small);
-            # no disk touched -> statelessness preserved.
+            # entries keep this cheap. No disk touched -> statelessness preserved.
             with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
                 got = 0
+                used = 0
+                truncated = False
                 for i, p in enumerate(photos[:cap], 1):
                     try:
                         req = urllib.request.Request(
-                            p["url"], headers={"User-Agent": _OG_UA})
-                        data = opener.open(req, timeout=30).read()
+                            _validate_egress(p["url"]),
+                            headers={"User-Agent": _OG_UA})
+                        # read one byte past the remaining budget so an
+                        # over-budget image is detected without buffering all
+                        # of it, then dropped whole (a truncated JPEG in the
+                        # zip is worse than an absent one)
+                        data = opener.open(req, timeout=30).read(budget - used + 1)
+                    except HTTPException as e:
+                        log.error("zip photo %d rejected: %s", i, e.detail)
+                        continue
                     except Exception as e:
                         log.error("zip fetch failed photo %d: %s", i, str(e)[:120])
                         continue
+                    if used + len(data) > budget:
+                        log.warning("zip byte budget hit at photo %d/%d (%d bytes)",
+                                    i, len(photos), budget)
+                        truncated = True
+                        break
                     z.writestr(f"{name}_photo{i}.{p['ext']}", data)
+                    used += len(data)
                     got += 1
+                if truncated:
+                    z.writestr(
+                        "TRUNCATED.txt",
+                        f"Stopped after {got} of {len(photos)} photos: the "
+                        f"{budget}-byte limit was reached. Raise ZIP_MAX_BYTES "
+                        f"or download the remaining photos individually.\n")
             if not got:
                 raise HTTPException(502, "could not fetch any photo for the zip")
             return buf.getvalue()

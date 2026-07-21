@@ -64,6 +64,18 @@ STEALTH_PROFILES=off                           # disable entirely
 
 If a request is refused with a client-level block ("confirm you're not a bot", "rate-limit reached", checkpoint), YoinkT retries it **once** with a profile before giving up. The transport is an optional dependency: if it isn't installed, everything falls back to the stock client rather than erroring. `GET /api/health` reports what's actually active per site.
 
+### Egress guard
+
+The site allowlist checks the URL you *submit*. It says nothing about the URLs YoinkT then fetches — format URLs from the extractor, CDN URLs from the photo resolver, `og:video`/`og:image` tags scraped from page HTML, and every redirect hop along the way. Those are the ones the server actually opens sockets to, and they're now validated too:
+
+- **scheme allowlist** — http/https only. Python's default URL opener also speaks `file://` and `ftp://`, so a resolved `file:///etc/passwd` would previously have been read and streamed back. That handler is no longer wired up at all.
+- **destination denylist** — loopback, RFC1918, link-local (including the `169.254.169.254` cloud-metadata address), unique-local v6, multicast, and reserved ranges are refused.
+- **redirects revalidated per hop** — a public CDN URL that 302s to an internal address is stopped mid-chain.
+
+`ALLOW_PRIVATE_EGRESS=1` disables the address checks (not the scheme check) if you're fetching from a local test server. Behind `PROXY_URL`, address checks are skipped because the proxy — not YoinkT — resolves the name; the scheme check still applies.
+
+Known limit: this validates before connecting, so DNS rebinding (a name that resolves public here and private a moment later) isn't covered. Closing that needs connect-time IP pinning, which Python's urllib doesn't expose.
+
 ### Engine freshness
 
 The extraction engine rots — platforms change their internals and a build from last month stops working. It's the single most common cause of "it worked yesterday".

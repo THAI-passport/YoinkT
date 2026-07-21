@@ -355,7 +355,7 @@ check("gdl config flag is list", isinstance(app._gdl_config_flag(), list))
 check("gdl config flag empty or known",
       app._gdl_config_flag() in ([], ["--ignore-config"], ["--config-ignore"]))
 
-check("version v39", "v39" in app.APP_VERSION and "always-mp4" in app.APP_VERSION)
+check("version v40", "v40" in app.APP_VERSION and "always-mp4" in app.APP_VERSION)
 
 
 # ---- v39: engine pin must not drift across the four places it appears ----
@@ -383,6 +383,187 @@ check("run-local reads the pin file", "< ENGINE_VERSION" in _rl)
 _rl_code = "\n".join(l for l in _rl.splitlines() if not l.strip().startswith("#"))
 check("run-local no longer blind-upgrades the engine",
       "--upgrade yt-dlp" not in _rl_code.replace("--pre --upgrade yt-dlp", ""))
+
+
+import pathlib
+def _raises(fn):
+    try:
+        fn()
+    except Exception:
+        return True
+    return False
+
+
+# ---- v40: egress guard (SSRF), lock leak, zip byte budget ----
+# NOTE: these run without network. Literal-IP URLs skip DNS entirely, and the
+# bypass paths are pure logic. A "resolves fine" positive case is deliberately
+# NOT asserted here — it would need DNS and would go red on an offline runner.
+
+import urllib.request as _ur
+
+# scheme allowlist — the file:// hole was the sharp one: urllib's default
+# opener would have read and streamed a local file
+for _bad, _label in [
+    ("file:///etc/passwd", "file"),
+    ("ftp://example.com/x", "ftp"),
+    ("data:text/plain,hi", "data"),
+    ("gopher://example.com/", "gopher"),
+]:
+    check(f"egress rejects {_label} scheme", app._egress_reject_reason(_bad) is not None)
+
+# destination denylist — literal IPs, no resolution needed
+for _bad, _label in [
+    ("http://127.0.0.1:8000/api/health", "loopback v4"),
+    ("http://[::1]/", "loopback v6"),
+    ("http://169.254.169.254/latest/meta-data/", "cloud metadata"),
+    ("http://10.1.2.3/", "RFC1918 10/8"),
+    ("http://192.168.1.1/", "RFC1918 192.168/16"),
+    ("http://172.16.0.1/", "RFC1918 172.16/12"),
+    ("http://0.0.0.0/", "unspecified"),
+]:
+    _r = app._egress_reject_reason(_bad)
+    check(f"egress rejects {_label}", _r is not None and "non-public" in _r)
+
+check("egress rejects hostless URL", app._egress_reject_reason("http://") is not None)
+check("egress raises HTTPException", _raises(lambda: app._validate_egress("http://127.0.0.1/")))
+
+# documented bypasses
+_saved_allow, _saved_proxy = app.ALLOW_PRIVATE_EGRESS, app.PROXY_URL
+app.ALLOW_PRIVATE_EGRESS = True
+check("ALLOW_PRIVATE_EGRESS lets loopback through",
+      app._egress_reject_reason("http://127.0.0.1/") is None)
+check("ALLOW_PRIVATE_EGRESS still blocks file://",
+      app._egress_reject_reason("file:///etc/passwd") is not None)
+app.ALLOW_PRIVATE_EGRESS = False
+app.PROXY_URL = "http://proxy:3128"
+check("proxy mode skips local IP checks (proxy resolves, not us)",
+      app._egress_reject_reason("http://10.0.0.1/") is None)
+check("proxy mode still blocks file://",
+      app._egress_reject_reason("file:///etc/passwd") is not None)
+app.ALLOW_PRIVATE_EGRESS, app.PROXY_URL = _saved_allow, _saved_proxy
+
+# the opener itself must not be able to speak file:// or ftp:// at all
+_op = app._egress_opener()
+_handlers = [type(h).__name__ for h in _op.handlers]
+check("opener has no FileHandler", "FileHandler" not in _handlers)
+check("opener has no FTPHandler", not any("FTP" in h for h in _handlers))
+check("opener has no DataHandler", "DataHandler" not in _handlers)
+check("opener speaks http+https", "HTTPHandler" in _handlers and "HTTPSHandler" in _handlers)
+check("opener revalidates redirects",
+      any("GuardedRedirect" in h for h in _handlers))
+check("opener redirect handler subclasses urllib's",
+      any(isinstance(h, _ur.HTTPRedirectHandler) for h in _op.handlers))
+
+# a redirect hop to a blocked destination must abort the chain
+_gr = [h for h in _op.handlers if "GuardedRedirect" in type(h).__name__][0]
+check("redirect to metadata IP is blocked mid-chain",
+      _raises(lambda: _gr.redirect_request(None, None, 302, "Found", {},
+                                           "http://169.254.169.254/")))
+
+# ---- info-lock leak on failed extraction ----
+import asyncio as _aio
+app._INFO_CACHE.clear(); app._info_locks.clear()
+
+def _boom(_u):
+    raise RuntimeError("extract failed")
+
+_saved_extract = app._extract
+app._extract = _boom
+try:
+    for _i in range(25):
+        try:
+            _aio.run(app._extract_cached(f"https://youtube.com/watch?v=dead{_i}"))
+        except Exception:
+            pass
+finally:
+    app._extract = _saved_extract
+check("failed extractions leave no orphan locks", len(app._info_locks) == 0)
+check("failed extractions cache nothing", len(app._INFO_CACHE) == 0)
+check("failed extractions leave no orphan refcounts", len(app._info_lock_users) == 0)
+app._INFO_CACHE.clear(); app._info_locks.clear(); app._info_lock_users.clear()
+
+# REGRESSION (v40 self-inflicted): the first cut of the leak fix reclaimed the
+# lock when `not lock.locked()`. asyncio.Lock.release() clears _locked BEFORE
+# waking the next waiter, so that is True while a waiter is still queued --
+# the lock got popped mid-handoff and the NEXT caller setdefault()d a SECOND
+# lock for the same URL, running a concurrent extraction. Assert one identity.
+# Reproducing the race needs STAGGERED arrival, not just concurrency: callers
+# that all arrive up front share one lock object regardless of the bug, because
+# every setdefault happens before the erroneous pop. The failure only shows
+# when a caller arrives AFTER the holder popped the lock while a waiter is
+# still mid-extraction -- that caller creates a second lock for the same URL
+# and extracts concurrently with the waiter.
+class _SpyLocks(dict):
+    def __init__(self):
+        super().__init__()
+        self.handed_out = []
+    def setdefault(self, k, v):
+        got = super().setdefault(k, v)
+        self.handed_out.append((k, id(got)))
+        return got
+
+_url = "https://youtube.com/watch?v=raceme"
+
+def _slow_boom(_u):
+    import time as _tt
+    _tt.sleep(0.05)
+    raise RuntimeError("extract failed")
+
+async def _race():
+    async def one():
+        try:
+            await app._extract_cached(_url)
+        except Exception:
+            pass
+    a = _aio.create_task(one())          # acquires, extracts, fails, releases
+    b = _aio.create_task(one())          # queues as waiter behind a
+    await _aio.sleep(0.08)               # a has failed+popped; b now extracting
+    c = _aio.create_task(one())          # arrives in the window -> new lock?
+    await _aio.gather(a, b, c)
+
+_saved_extract, _saved_locks = app._extract, app._info_locks
+_spy = _SpyLocks()
+app._extract = _slow_boom
+app._info_locks = _spy
+try:
+    _aio.run(_race())
+finally:
+    app._extract, app._info_locks = _saved_extract, _saved_locks
+
+_ids = {i for k, i in _spy.handed_out if k == _url}
+check("late caller never gets a second lock for an in-flight URL", len(_ids) == 1)
+check("race run leaves no orphan locks", len(app._info_locks) == 0)
+check("race run leaves no orphan refcounts", len(app._info_lock_users) == 0)
+
+check("race run leaves no orphan refcounts", len(app._info_lock_users) == 0)
+app._INFO_CACHE.clear(); app._info_locks.clear(); app._info_lock_users.clear()
+
+# the lock-handoff window itself, asserted directly so the reasoning above
+# doesn't silently rot if CPython changes Lock internals
+async def _window():
+    lk = _aio.Lock()
+    await lk.acquire()
+    t = _aio.create_task((lambda: _hold(lk))())
+    await _aio.sleep(0)
+    lk.release()
+    observed = lk.locked()
+    await t
+    return observed
+
+async def _hold(lk):
+    async with lk:
+        pass
+
+check("locked() alone is NOT a safe 'unused' signal", _aio.run(_window()) is False)
+
+# ---- zip byte budget ----
+check("ZIP_MAX_BYTES default is finite",
+      int(os.environ.get("ZIP_MAX_BYTES", str(256 * 1024 * 1024))) > 0)
+_zsrc = pathlib.Path("backend/app.py").read_text()
+check("zip enforces a byte budget", "ZIP_MAX_BYTES" in _zsrc and "budget - used + 1" in _zsrc)
+check("zip drops over-budget image whole (no truncated file)",
+      "truncated = True" in _zsrc and "TRUNCATED.txt" in _zsrc)
+check("zip validates each photo URL", "_validate_egress(p[\"url\"])" in _zsrc)
 
 print(f"\nTOTAL {ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)

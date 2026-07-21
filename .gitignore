@@ -46,4 +46,4 @@ claude.json
 *.prompts
 
 YTDLP-GAP-ANALYSIS.md
-COMMIT_MSG_v39.txt
+COMMIT_MSG_*.txt
