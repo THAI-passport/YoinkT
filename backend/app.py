@@ -75,7 +75,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-APP_VERSION = "YoinkT v42-always-mp4-budget"  # bump on behavior changes; shown in UI footer
+APP_VERSION = "YoinkT v43-always-mp4-quality"  # bump on behavior changes; shown in UI footer
 # NOTE: keep the substring "always-mp4" — run-local.sh greps for it
 
 PROXY_URL = os.environ.get("PROXY_URL") or None
@@ -195,6 +195,47 @@ _turbo_active = 0  # in-flight turbo prepares; drives the per-download split
 def _turbo_conns(active: int) -> int:
     """Connections for one turbo download, given how many are running."""
     return max(TURBO_MIN_CONNS, TURBO_CONN_BUDGET // max(1, active))
+
+
+# Aggregate scratch budget. N buffered downloads stage N whole videos at once;
+# without this the only limit was the volume filling up mid-download, which
+# surfaces as a confusing partial failure. Reserve up front, refuse politely.
+SCRATCH_BUDGET = int(os.environ.get("SCRATCH_BUDGET", str(8 * 1024**3)))
+_scratch_reserved = 0
+
+
+def _estimate_bytes(info: dict, kind: str) -> int:
+    """Best-effort size of what the buffered path is about to stage.
+
+    Deliberately generous: under-estimating means admitting a download that
+    then fills the volume, which is the failure we're preventing. A merge also
+    holds both source streams AND the muxed output at once, hence the 2.2x."""
+    fmts = info.get("formats") or []
+
+    def _sz(f):
+        return f.get("filesize") or f.get("filesize_approx") or 0
+
+    if kind.startswith("p:"):
+        f = next((x for x in fmts if x.get("format_id") == kind[2:]), None)
+        base = _sz(f) if f else 0
+        mult = 1.2
+    elif kind.startswith(("m:", "c:")):
+        h = int(kind[2:]) if kind[2:].isdigit() else 0
+        vids = [f for f in fmts if f.get("height") == h and f.get("acodec") == "none"]
+        auds = [f for f in fmts if f.get("vcodec") == "none" and f.get("acodec") != "none"]
+        base = (max((_sz(f) for f in vids), default=0)
+                + max((_sz(f) for f in auds), default=0))
+        mult = 2.2   # both inputs on disk plus the muxed output
+    else:
+        auds = [f for f in fmts if f.get("vcodec") == "none" and f.get("acodec") != "none"]
+        base = max((_sz(f) for f in auds), default=0)
+        mult = 2.0   # transcode writes a second file
+    if not base:
+        # No size metadata (common for DASH): fall back to duration x a
+        # pessimistic bitrate rather than admitting an unbounded download.
+        dur = float(info.get("duration") or 0)
+        base = int(dur * 1.5 * 1024**2 / 8) if dur else 512 * 1024**2
+    return int(base * mult)
 
 
 def _scratch_root() -> str:
@@ -583,6 +624,84 @@ def _is_block_error(e: Exception) -> bool:
     return any(h in m for h in _BLOCK_HINTS)
 
 
+# ---- error taxonomy ---------------------------------------------------------
+# Extraction failures used to surface as `502 extract failed: <raw engine
+# stderr>`. That text is written for someone reading a terminal with the full
+# command in scroll-back, not for someone who pasted a link into a web page —
+# it names internal clients and flags, and never says what to DO. Every rule
+# below maps a recognised failure to an action the user can actually take.
+#
+# Ordered: first match wins, so put specific patterns above general ones.
+# `hint` is what the UI shows; `status` distinguishes "your fault" (4xx) from
+# "our/upstream fault" (5xx) so the frontend can decide whether to offer retry.
+_ERROR_RULES: list[tuple[tuple[str, ...], int, str]] = [
+    (("sign in to confirm you're not a bot", "sign in to confirm you’re not a bot",
+      "confirm you're not a bot", "confirm you’re not a bot"),
+     403, "{site} is challenging this server as a bot. Add cookies for {site} "
+          "(the cookie wizard), or route the server through a residential proxy."),
+    (("confirm your age", "age-restricted", "inappropriate for some users"),
+     403, "This video is age-restricted. {site} requires a signed-in session — "
+          "add cookies for {site} (a throwaway account is fine)."),
+    (("login required", "requires authentication", "you must be logged in",
+      "private video", "this post is private", "not available to you"),
+     403, "This post is private or needs a login. Add cookies for {site} from "
+          "an account that can see it."),
+    (("rate-limit reached", "rate limit reached", "too many requests",
+      "please wait a few minutes", "http error 429"),
+     429, "{site} is rate-limiting this server. Wait a few minutes and retry; "
+          "if you're batch-downloading, use fewer lanes."),
+    (("not available in your country", "geo restricted", "geo-restricted",
+      "blocked in your country", "not available from your location"),
+     451, "{site} blocks this content from the server's location. Set PROXY_URL "
+          "to somewhere it's available."),
+    (("video unavailable", "this video is not available", "content isn't available",
+      "no longer available", "has been removed", "video has been removed"),
+     404, "That video is unavailable or has been removed."),
+    (("is not a valid url", "unsupported url", "no suitable extractor"),
+     400, "That link isn't one YoinkT can handle. Check it points at a single "
+          "post or video on a supported site."),
+    (("members-only", "join this channel", "paid members", "purchase", "rental"),
+     402, "This is paywalled or members-only content."),
+    (("live event will begin", "premiere", "this live event has not started",
+      "is not currently live"),
+     425, "This is a scheduled or upcoming stream — nothing to download yet."),
+    (("unable to download webpage", "unable to connect", "connection reset",
+      "timed out", "temporary failure in name resolution", "network is unreachable"),
+     504, "Couldn't reach {site} from the server. Check the server's network "
+          "or proxy settings and retry."),
+    (("no space left", "enospc"),
+     507, "The server ran out of scratch space. Free space in SCRATCH_DIR, or "
+          "give the pod a bigger disk-backed volume."),
+    (("nsig extraction failed", "unable to extract", "player response",
+      "failed to parse json", "signature extraction"),
+     502, "{site} changed something the extraction engine doesn't understand "
+          "yet. Update the engine build (ENGINE_VERSION) and retry."),
+]
+
+_SITE_LABEL = {"youtube": "YouTube", "x": "X", "facebook": "Facebook",
+               "instagram": "Instagram", "tiktok": "TikTok"}
+
+
+def _classify_error(exc: BaseException, site: str = "youtube") -> HTTPException:
+    """Turn an engine failure into an HTTP error a person can act on.
+
+    The raw engine text is still attached as `detail.raw` (truncated) so the
+    cause isn't lost — the UI shows `hint`, a bug report can quote `raw`."""
+    raw = str(exc).strip()
+    low = raw.lower()
+    label = _SITE_LABEL.get(site, site)
+    for needles, status, hint in _ERROR_RULES:
+        if any(n in low for n in needles):
+            return HTTPException(status, {"hint": hint.format(site=label),
+                                          "raw": raw[-400:]})
+    # Unrecognised: say so honestly rather than inventing a diagnosis. A stale
+    # engine is the most common cause of a novel error, so point there.
+    return HTTPException(502, {
+        "hint": f"{label} extraction failed for an unrecognised reason. If this "
+                "persists, the extraction engine build may need updating.",
+        "raw": raw[-400:]})
+
+
 def _extract(url: str) -> dict:
     import yt_dlp
 
@@ -800,16 +919,55 @@ def _curate_formats(info: dict) -> list[dict]:
     audio = [f for f in fmts if f.get("vcodec") == "none" and f.get("acodec") != "none"]
     if audio:
         best_a = max(audio, key=lambda f: (f.get("abr") or f.get("tbr") or 0))
+        _ext = best_a.get("ext", "m4a")
+        _codec = str(best_a.get("acodec") or "")
+        # The best audio YouTube serves is usually OPUS. Handing it back
+        # untouched is both higher quality AND cheaper than the MP3 entry
+        # below, which decodes and re-encodes it (generation loss + CPU).
+        # Label it with the real codec so the choice is visible instead of
+        # everything being an anonymous "audio only".
+        _nice = ("Opus" if "opus" in _codec else
+                 "AAC" if _codec.startswith("mp4a") else
+                 "FLAC" if "flac" in _codec else
+                 _codec.split(".")[0].upper() or _ext.upper())
         out.append({
             "kind": "a:audio",
-            "label": "audio only",
+            "label": f"audio · {_nice}",
             "height": 0,
-            "ext": best_a.get("ext", "m4a"),
+            "ext": _ext,
             "fps": None,
             "filesize": best_a.get("filesize") or best_a.get("filesize_approx"),
-            "note": f"{int(best_a.get('abr') or 0)}kbps",
+            "note": f"{int(best_a.get('abr') or 0)}kbps · original, no re-encode",
             "resumable": True,
+            "lossless_passthrough": True,
         })
+        # Second-best DISTINCT codec, when there is one — lets someone on an
+        # Apple device take AAC directly rather than falling back to MP3,
+        # which would be a needless re-encode of the same audio.
+        _alt = None
+        for f in sorted(audio, key=lambda f: -(f.get("abr") or f.get("tbr") or 0)):
+            c = str(f.get("acodec") or "")
+            same = ("opus" in c) == ("opus" in _codec) and \
+                   c.startswith("mp4a") == _codec.startswith("mp4a")
+            if not same:
+                _alt = f
+                break
+        if _alt:
+            c = str(_alt.get("acodec") or "")
+            alt_nice = ("Opus" if "opus" in c else
+                        "AAC" if c.startswith("mp4a") else
+                        c.split(".")[0].upper())
+            out.append({
+                "kind": f"a:{_alt['format_id']}",
+                "label": f"audio · {alt_nice}",
+                "height": 0,
+                "ext": _alt.get("ext", "m4a"),
+                "fps": None,
+                "filesize": _alt.get("filesize") or _alt.get("filesize_approx"),
+                "note": f"{int(_alt.get('abr') or 0)}kbps · original, no re-encode",
+                "resumable": True,
+                "lossless_passthrough": True,
+            })
         out.append({
             "kind": "mp3",
             "label": "MP3",
@@ -817,7 +975,7 @@ def _curate_formats(info: dict) -> list[dict]:
             "ext": "mp3",
             "fps": None,
             "filesize": None,  # transcoded, size unknown ahead of time
-            "note": "audio · mp3",
+            "note": "re-encoded · for old players",
         })
     return out
 
@@ -1222,6 +1380,74 @@ def _fetch_url(u: str) -> bytes:
     return _egress_opener().open(_validate_egress(u), timeout=30).read()
 
 
+# ---- SponsorBlock: mark mode --------------------------------------------
+# `sb=1` (remove) cuts the segments out, which means the whole file has to be
+# downloaded and re-cut — that's why it lives on the buffered path and needs
+# scratch disk. `sb=mark` instead turns each segment into a CHAPTER, which
+# costs nothing: the streaming merge already writes an ffmetadata chapter
+# block, so marked segments are just more chapters. Fully streaming, no disk,
+# no re-encode. The user skips with their player's chapter controls.
+_SB_API = os.environ.get("SPONSORBLOCK_API", "https://sponsor.ajay.app")
+_SB_CATEGORIES = os.environ.get(
+    "SPONSORBLOCK_CATEGORIES",
+    "sponsor,selfpromo,interaction,intro,outro,preview,music_offtopic")
+_SB_LABELS = {
+    "sponsor": "Sponsor", "selfpromo": "Self-promo", "interaction": "Interaction",
+    "intro": "Intro", "outro": "Outro", "preview": "Preview",
+    "music_offtopic": "Non-music", "filler": "Filler",
+}
+
+
+def _sb_segments(video_id: str) -> list[dict]:
+    """Fetch SponsorBlock segments for a video. Returns [] on any failure —
+    marking is a nice-to-have and must never fail a download."""
+    import json
+    from urllib.parse import quote
+    cats = json.dumps([c.strip() for c in _SB_CATEGORIES.split(",") if c.strip()])
+    url = (f"{_SB_API}/api/skipSegments?videoID={quote(video_id)}"
+           f"&categories={quote(cats)}")
+    try:
+        raw = _egress_opener().open(_validate_egress(url), timeout=10).read()
+        data = json.loads(raw.decode("utf-8", "replace"))
+    except Exception as e:
+        log.info("sponsorblock lookup failed for %s: %s", video_id, str(e)[:120])
+        return []
+    segs = []
+    for item in data if isinstance(data, list) else []:
+        seg = item.get("segment") or []
+        if len(seg) == 2 and seg[1] > seg[0]:
+            segs.append({"start": float(seg[0]), "end": float(seg[1]),
+                         "category": item.get("category", "segment")})
+    segs.sort(key=lambda s: s["start"])
+    return segs
+
+
+def _merge_sb_chapters(chapters: list | None, segs: list[dict]) -> list[dict]:
+    """Fold SponsorBlock segments into the chapter list as extra chapters.
+
+    Kept simple on purpose: ffmpeg chapters must not overlap, so rather than
+    trying to split existing chapters around each segment (which produces
+    fragile off-by-one boundaries on long videos), SB segments WIN for their
+    time range and surrounding chapters are trimmed around them."""
+    marks = [{"start_time": s["start"], "end_time": s["end"],
+              "title": f"[{_SB_LABELS.get(s['category'], s['category'])}]"}
+             for s in segs]
+    if not marks:
+        return list(chapters or [])
+    out = []
+    for ch in (chapters or []):
+        cs, ce = ch.get("start_time", 0), ch.get("end_time", 0)
+        for m in marks:
+            if m["start_time"] < ce and m["end_time"] > cs:
+                # overlaps a mark: keep only the part before it
+                ce = min(ce, m["start_time"])
+        if ce > cs:
+            out.append({**ch, "start_time": cs, "end_time": ce})
+    out.extend(marks)
+    out.sort(key=lambda c: c["start_time"])
+    return out
+
+
 def _ffmeta_chapters(chapters: list[dict]) -> str:
     lines = [";FFMETADATA1"]
     for c in chapters:
@@ -1320,13 +1546,13 @@ async def api_info(url: str = Query(...)):
             except HTTPException:
                 raise
             except Exception as e:
-                raise HTTPException(502, f"extract failed: {e}") from e
+                raise _classify_error(e, site) from e
         return _social_api_info(url, bundle, site)
     async with sem:
         try:
             info = await _extract_cached(url)
         except Exception as e:  # yt-dlp raises many types; surface message
-            raise HTTPException(502, f"extract failed: {e}") from e
+            raise _classify_error(e, site) from e
     subs = [{"lang": l, "auto": False} for l in (info.get("subtitles") or {})]
     subs += [{"lang": l, "auto": True} for l in (info.get("automatic_captions") or {})
              if l not in {s["lang"] for s in subs}]
@@ -1358,7 +1584,7 @@ async def api_playlist(url: str = Query(...)):
         try:
             info = await asyncio.to_thread(_extract_flat)
         except Exception as e:
-            raise HTTPException(502, f"extract failed: {e}") from e
+            raise _classify_error(e, "youtube") from e
     entries = info.get("entries") or []
     out, avail = [], 0
     for e in entries[:400]:
@@ -1398,7 +1624,7 @@ async def api_subs(url: str = Query(...), lang: str = Query(...)):
     try:
         info = await _extract_cached(url)
     except Exception as e:
-        raise HTTPException(502, f"extract failed: {e}") from e
+        raise _classify_error(e, "youtube") from e
     pools = [info.get("subtitles") or {}, info.get("automatic_captions") or {}]
     tracks = next((p[lang] for p in pools if lang in p), None)
     if not tracks:
@@ -1407,7 +1633,7 @@ async def api_subs(url: str = Query(...), lang: str = Query(...)):
     try:
         raw = await asyncio.to_thread(_fetch_url, track["url"])
     except Exception as e:
-        raise HTTPException(502, f"subtitle fetch failed: {e}") from e
+        raise _classify_error(e, _site_of(url) or "youtube") from e
     srt = _vtt_to_srt(raw.decode("utf-8", "replace"))
     name = _safe_name(info.get("title", "video"))
     from fastapi.responses import Response
@@ -1723,7 +1949,8 @@ def _sb_selector(kind: str, info: dict, codec: str = "") -> str:
 
 
 async def _file_download(url: str, selector: str, name: str, audio_only: bool,
-                         sb: bool, turbo: bool, site: str = "youtube") -> StreamingResponse:
+                         sb: bool, turbo: bool, site: str = "youtube",
+                         est_bytes: int = 0) -> StreamingResponse:
     """Buffered download path for options that CAN'T stream:
       - turbo: aria2c opens many parallel connections (each gets its own
         YouTube throttle allowance) -> much faster single downloads, but
@@ -1744,9 +1971,41 @@ async def _file_download(url: str, selector: str, name: str, audio_only: bool,
     # way — doing the work before the response costs no extra latency and
     # buys real HTTP status codes. Long prepares need the same generous
     # ingress read timeouts the streaming paths already require.
+    # Pre-flight: reserve the estimated size against the shared budget AND
+    # check the volume actually has room. Refusing up front with a clear 507
+    # beats filling the volume and failing halfway through — especially in a
+    # batch, where one oversized item would otherwise take the whole run down.
+    global _scratch_reserved
+    root = _scratch_root()
+    if est_bytes > SCRATCH_BUDGET:
+        raise HTTPException(
+            507, {"hint": f"This download needs about {est_bytes // 1024**2} MB of "
+                          f"scratch space but the budget is "
+                          f"{SCRATCH_BUDGET // 1024**2} MB. Raise SCRATCH_BUDGET, "
+                          "or download it without Turbo/SponsorBlock (the "
+                          "streaming path needs no disk).",
+                  "raw": f"est={est_bytes} budget={SCRATCH_BUDGET}"})
+    if _scratch_reserved + est_bytes > SCRATCH_BUDGET:
+        raise HTTPException(
+            503, {"hint": "The server is already staging as much as it can hold. "
+                          "Retry in a moment, or use fewer batch lanes.",
+                  "raw": f"reserved={_scratch_reserved} est={est_bytes} "
+                         f"budget={SCRATCH_BUDGET}"})
+    try:
+        free = shutil.disk_usage(root).free
+    except Exception:
+        free = None
+    if free is not None and est_bytes > free:
+        raise HTTPException(
+            507, {"hint": f"Not enough free space in {root}: needs about "
+                          f"{est_bytes // 1024**2} MB, {free // 1024**2} MB free. "
+                          "On Kubernetes, grow the scratch volume.",
+                  "raw": f"est={est_bytes} free={free} dir={root}"})
+    _scratch_reserved += est_bytes
+
     # DISK-backed scratch, never the RAM tmpfs that holds the merge FIFOs —
     # this writes the whole video (see SCRATCH_DIR).
-    tmp = tempfile.mkdtemp(prefix="ytgrab-dl-", dir=_scratch_root())
+    tmp = tempfile.mkdtemp(prefix="ytgrab-dl-", dir=root)
 
     def _build_cmd(conns: int) -> list[str]:
         outtmpl = os.path.join(tmp, "out.%(ext)s")
@@ -1819,6 +2078,7 @@ async def _file_download(url: str, selector: str, name: str, audio_only: bool,
         path = os.path.join(tmp, [f for f in os.listdir(tmp)
                                   if f.startswith("out.")][0])
     except BaseException:
+        _scratch_reserved -= est_bytes
         shutil.rmtree(tmp, ignore_errors=True)
         raise
 
@@ -1828,6 +2088,8 @@ async def _file_download(url: str, selector: str, name: str, audio_only: bool,
                 while chunk := await asyncio.to_thread(fh.read, 1024 * 1024):
                     yield chunk
         finally:
+            global _scratch_reserved
+            _scratch_reserved -= est_bytes
             shutil.rmtree(tmp, ignore_errors=True)
 
     ext = "mp3" if audio_only else "mp4"
@@ -1842,7 +2104,7 @@ async def api_download(
     request: Request,
     url: str = Query(...), kind: str = Query(...),
     start: float | None = Query(None, ge=0), end: float | None = Query(None, gt=0),
-    sb: int = Query(0), turbo: int = Query(0), codec: str = Query(""),
+    sb: str = Query(""), turbo: int = Query(0), codec: str = Query(""),
 ):
     site = _require_site(url)
     clip = start is not None and end is not None
@@ -1852,6 +2114,13 @@ async def api_download(
         raise HTTPException(
             400, "Turbo needs aria2c. Install it (macOS: brew install aria2) "
             "or rebuild the Docker image, then retry.")
+    sb = (sb or "").strip().lower()
+    if sb in ("0", "false", "none"):
+        sb = ""
+    sb_remove = sb in ("1", "true", "remove")   # buffered: cuts segments out
+    sb_mark = sb == "mark"                       # streaming: chapters only
+    if sb and not (sb_remove or sb_mark):
+        raise HTTPException(400, "sb must be 1 (remove) or 'mark'")
     if sb and site != "youtube":
         raise HTTPException(400, "SponsorBlock is YouTube-only")
 
@@ -1862,7 +2131,7 @@ async def api_download(
         except HTTPException:
             raise
         except Exception as e:
-            raise HTTPException(502, f"extract failed: {e}") from e
+            raise _classify_error(e, site) from e
         vinfo = bundle["vinfo"] or {}
         # single-video posts extract as a 1-entry playlist — unwrap it so the
         # p:/mp3 format lookups below see the real format list
@@ -1873,7 +2142,7 @@ async def api_download(
         try:
             info = await _extract_cached(url)
         except Exception as e:
-            raise HTTPException(502, f"extract failed: {e}") from e
+            raise _classify_error(e, site) from e
         name = _safe_name(info.get("title", "video"))
     if clip:
         name += f"_clip_{int(start)}-{int(end)}"
@@ -1990,16 +2259,26 @@ async def api_download(
     # time range, the buffered path hands the whole pipeline to yt-dlp. This
     # used to fall through silently to the clip path with turbo/sb quietly
     # dropped; say so instead of pretending the option was honoured.
-    if (sb or turbo) and clip:
+    if (sb_remove or turbo) and clip:
         opts = " and ".join(m for m, on in
-                            (("Turbo", turbo), ("SponsorBlock", sb)) if on)
+                            (("Turbo", turbo), ("SponsorBlock", sb_remove)) if on)
         raise HTTPException(
             400, f"{opts} cannot be combined with clipping — "
                  "download the clip without it, or the full video with it.")
-    if sb or turbo:
-        audio_only = kind in ("mp3", "a:audio")
+    if sb_remove or turbo:
+        audio_only = kind == "mp3" or kind.startswith("a:")
         return await _file_download(url, _sb_selector(kind, info, codec), name,
-                                    audio_only, bool(sb), bool(turbo), site=site)
+                                    audio_only, sb_remove, bool(turbo), site=site,
+                                    est_bytes=_estimate_bytes(info, kind))
+
+    # sb=mark: fold SponsorBlock segments in as CHAPTERS. Streaming path, no
+    # scratch disk, no re-encode — the merge already emits a chapter block.
+    chapters = info.get("chapters")
+    if sb_mark:
+        vid = info.get("id") or ""
+        segs = await asyncio.to_thread(_sb_segments, vid) if vid else []
+        chapters = _merge_sb_chapters(chapters, segs)
+        log.info("sponsorblock mark: %d segment(s) for %s", len(segs), vid)
 
     if kind == "mp3":  # transcode best audio -> streamable MP3
         audio = [f for f in (info.get("formats") or [])
@@ -2060,7 +2339,7 @@ async def api_download(
             return await _stream_proc(cmd, "video/mp4", f"{name}.mp4")
         return _stream_merge(url, v["format_id"], a["format_id"],
                              f"{name}.mp4", audio_copy=audio_copy,
-                             chapters=info.get("chapters"), site=site)
+                             chapters=chapters, site=site)
 
     if kind.startswith("m:"):  # DASH merge -> always MP4
         height = int(kind[2:])
@@ -2083,7 +2362,7 @@ async def api_download(
                                     ["-map", "0:v:0", "-map", "1:a:0"])
                     return await _stream_proc(cmd, "video/mp4", f"{name}.mp4")
                 return _stream_merge(url, v["format_id"], a["format_id"],
-                                     f"{name}.mp4", audio_copy=ac, chapters=info.get("chapters"), site=site)
+                                     f"{name}.mp4", audio_copy=ac, chapters=chapters, site=site)
         # QUALITY over codec: pick highest-bitrate video at this height no
         # matter the codec. YouTube's H.264 1080p is bitrate-starved and looks
         # visibly worse than VP9/AV1 at the same label — preferring avc1 for
@@ -2108,15 +2387,23 @@ async def api_download(
             return await _stream_proc(cmd, "video/mp4", f"{name}.mp4")
         return _stream_merge(url, v["format_id"], a["format_id"],
                              f"{name}.mp4", audio_copy=audio_copy,
-                             chapters=info.get("chapters"), site=site)
+                             chapters=chapters, site=site)
 
-    if kind == "a:audio":
+    if kind.startswith("a:"):
         # pick the actual best audio so the file extension matches its codec
         audio = [f for f in (info.get("formats") or [])
                  if f.get("vcodec") == "none" and f.get("acodec") != "none"]
         if not audio:
             raise HTTPException(404, "no audio format")
-        best_a = max(audio, key=lambda f: (f.get("abr") or f.get("tbr") or 0))
+        want = kind[2:]
+        if want and want != "audio":
+            # explicit codec pick (a:<format_id>) — a second passthrough option
+            # so Apple users can take AAC directly instead of re-encoding to MP3
+            best_a = next((f for f in audio if f.get("format_id") == want), None)
+            if not best_a:
+                raise HTTPException(404, "audio format not available")
+        else:
+            best_a = max(audio, key=lambda f: (f.get("abr") or f.get("tbr") or 0))
         if clip:
             ac = (["-c:a", "copy"] if str(best_a.get("acodec", "")).startswith("mp4a")
                   else ["-c:a", "aac", "-b:a", "160k"])

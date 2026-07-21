@@ -355,7 +355,7 @@ check("gdl config flag is list", isinstance(app._gdl_config_flag(), list))
 check("gdl config flag empty or known",
       app._gdl_config_flag() in ([], ["--ignore-config"], ["--config-ignore"]))
 
-check("version v42", "v42" in app.APP_VERSION and "always-mp4" in app.APP_VERSION)
+check("version v43", "v43" in app.APP_VERSION and "always-mp4" in app.APP_VERSION)
 
 
 # ---- v39: engine pin must not drift across the four places it appears ----
@@ -657,8 +657,8 @@ check("active counter decremented in finally",
       "_turbo_active -= 1" in _fdsrc and "finally:" in _fdsrc)
 
 # scratch storage must be separate from the RAM tmpfs holding merge FIFOs
-check("buffered downloads use the scratch root",
-      "dir=_scratch_root()" in _fdsrc)
+check("buffered downloads stage in the scratch root, not the RAM tmpfs",
+      "_scratch_root()" in _fdsrc and "mkdtemp(prefix=\"ytgrab-dl-\", dir=root)" in _fdsrc)
 check("_scratch_root returns a writable dir", os.access(app._scratch_root(), os.W_OK))
 check("scratch falls back rather than raising", isinstance(app._scratch_root(), str))
 check("out-of-space is reported as 507, not a generic failure",
@@ -680,6 +680,99 @@ check("k8s pins ZIP_MAX_BYTES explicitly", "ZIP_MAX_BYTES" in _k8s)
 
 check("health reports the turbo budget", "turbo_budget" in _i2.getsource(app.health))
 check("health reports the scratch dir", '"scratch"' in _i2.getsource(app.health))
+
+
+# ---- v43: error taxonomy, audio passthrough, sb=mark, scratch budget ----
+
+# 1. error taxonomy — every rule must produce an ACTION, not just a restatement
+_cases = [
+    ("Sign in to confirm you're not a bot", 403, "cookie"),
+    ("Sign in to confirm your age", 403, "cookies"),
+    ("This video is private. Login required", 403, "cookies"),
+    ("HTTP Error 429: Too Many Requests", 429, "wait"),
+    ("Video not available in your country", 451, "PROXY_URL"),
+    ("Video unavailable", 404, "unavailable"),
+    ("Unsupported URL: https://example.com/x", 400, "supported site"),
+    ("This video is available to members-only", 402, "members-only"),
+    ("nsig extraction failed", 502, "ENGINE_VERSION"),
+    ("No space left on device", 507, "scratch"),
+]
+for _msg, _want, _needle in _cases:
+    _exc = app._classify_error(Exception(_msg), "youtube")
+    check(f"taxonomy: {_msg[:34]!r} -> {_want}", _exc.status_code == _want)
+    check(f"taxonomy: {_msg[:24]!r} is actionable",
+          _needle.lower() in _exc.detail["hint"].lower())
+_unknown = app._classify_error(Exception("kwyjibo"), "x")
+check("unknown errors admit they're unknown", _unknown.status_code == 502
+      and "unrecognised" in _unknown.detail["hint"])
+check("raw engine text is preserved for bug reports",
+      "kwyjibo" in _unknown.detail["raw"])
+check("site name is humanised in hints that name a site",
+      app._classify_error(Exception("HTTP Error 429"), "x").detail["hint"].startswith("X ")
+      and app._classify_error(Exception("HTTP Error 429"), "instagram"
+                              ).detail["hint"].startswith("Instagram "))
+check("no raw 'extract failed:' strings remain",
+      'f"extract failed: {e}"' not in pathlib.Path("backend/app.py").read_text())
+
+# 2. audio passthrough — the best audio must be offered UNTOUCHED
+_info = {"formats": [
+    {"format_id": "251", "vcodec": "none", "acodec": "opus", "abr": 160, "ext": "webm",
+     "filesize": 5_000_000},
+    {"format_id": "140", "vcodec": "none", "acodec": "mp4a.40.2", "abr": 128, "ext": "m4a",
+     "filesize": 4_000_000},
+    {"format_id": "137", "vcodec": "avc1.640028", "acodec": "none", "height": 1080,
+     "ext": "mp4", "filesize": 50_000_000, "tbr": 4000},
+]}
+_out = app._curate_formats(_info)
+_akinds = [f["kind"] for f in _out if f["height"] == 0]
+check("best audio offered as passthrough", "a:audio" in _akinds)
+check("second codec offered as passthrough too", "a:140" in _akinds)
+check("mp3 still offered for old players", "mp3" in _akinds)
+_best = next(f for f in _out if f["kind"] == "a:audio")
+check("passthrough labelled with real codec", "Opus" in _best["label"])
+check("passthrough says no re-encode", "no re-encode" in _best["note"])
+check("passthrough is flagged", _best.get("lossless_passthrough") is True)
+check("mp3 is marked as re-encoded", 
+      next(f for f in _out if f["kind"] == "mp3")["note"].startswith("re-encoded"))
+check("explicit audio format id is a distinct codec",
+      next(f for f in _out if f["kind"] == "a:140")["label"].endswith("AAC"))
+
+# 3. sb=mark — chapters, no buffering
+_segs = [{"start": 10.0, "end": 30.0, "category": "sponsor"},
+         {"start": 100.0, "end": 110.0, "category": "outro"}]
+_ch = [{"start_time": 0.0, "end_time": 60.0, "title": "Part 1"},
+       {"start_time": 60.0, "end_time": 120.0, "title": "Part 2"}]
+_merged = app._merge_sb_chapters(_ch, _segs)
+check("sb marks become chapters", any("[Sponsor]" == c["title"] for c in _merged))
+check("category labels are humanised", any("[Outro]" == c["title"] for c in _merged))
+check("chapters stay sorted",
+      [c["start_time"] for c in _merged] == sorted(c["start_time"] for c in _merged))
+check("no chapter overlaps a mark (ffmpeg requires this)",
+      all(a["end_time"] <= b["start_time"] + 1e-9
+          for a, b in zip(_merged, _merged[1:])))
+check("no marks -> chapters untouched", app._merge_sb_chapters(_ch, []) == _ch)
+check("segments fetched over the guarded opener",
+      "_egress_opener()" in _i2.getsource(app._sb_segments))
+check("sponsorblock failure never breaks a download",
+      "return []" in _i2.getsource(app._sb_segments))
+_dsrc = _i2.getsource(app.api_download)
+check("sb=mark stays on the STREAMING path (no _file_download)",
+      _dsrc.index("if sb_mark:") > _dsrc.index("if sb_remove or turbo:"))
+check("sb=remove still forces the buffered path", "sb_remove or turbo" in _dsrc)
+
+# 4. scratch budget
+_est = app._estimate_bytes(_info, "m:1080")
+check("merge estimate covers both streams plus output", _est > 54_000_000)
+check("estimate falls back when sizes are missing",
+      app._estimate_bytes({"formats": [], "duration": 600}, "m:1080") > 0)
+check("estimate never returns zero", app._estimate_bytes({}, "m:1080") > 0)
+_fd2 = _i2.getsource(app._file_download)
+check("budget checked before staging", _fd2.index("SCRATCH_BUDGET") < _fd2.index("mkdtemp"))
+check("free disk checked too", "disk_usage" in _fd2)
+check("oversized single download -> 507", "507" in _fd2)
+check("budget-full -> 503 retryable", "503" in _fd2)
+check("reservation released on failure",
+      _fd2.count("_scratch_reserved -= est_bytes") >= 2)
 
 print(f"\nTOTAL {ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)
