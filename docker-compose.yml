@@ -21,6 +21,17 @@ services:
       MAX_CONCURRENCY: "6"        # simultaneous downloads (playlist lanes cap). Should be >= lanes you pick,
                                   # else extra downloads park at "0 B · Starting" waiting for a slot.
       CONCURRENT_FRAGMENTS: "16"  # parallel chunks WITHIN one video. Only helps if the format is fragmented.
+      # --- Turbo (aria2c) connection budget ---
+      # SHARED across all in-flight turbo downloads, not per-download. 16 conns
+      # already saturates a typical link on ONE video (the platform throttles
+      # each connection to ~2-4 MB/s), so running batch lanes at 16 each adds
+      # no throughput and just multiplies the connection count against one CDN
+      # — which is what trips rate-limiting. Lanes beyond TURBO_CONN_BUDGET /
+      # TURBO_MIN_CONNS queue rather than run degraded.
+      # TURBO_CONN_BUDGET: "16"
+      # TURBO_MIN_CONNS: "4"
+      # SCRATCH_DIR: "/scratch"   # disk for buffered downloads; k8s NEEDS this
+      # ZIP_MAX_BYTES: "67108864" # carousel zip is built in RAM — 64 MiB
       # STREAM_STALL_TIMEOUT: "120"  # seconds of no data before a hung stream is killed + slot freed.
       # --- full-speed / anti-throttle (PO tokens) — ENABLED by default ---
       # Routes through the bgutil-provider sidecar below: yt-dlp looks like a

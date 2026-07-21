@@ -355,7 +355,7 @@ check("gdl config flag is list", isinstance(app._gdl_config_flag(), list))
 check("gdl config flag empty or known",
       app._gdl_config_flag() in ([], ["--ignore-config"], ["--config-ignore"]))
 
-check("version v40", "v40" in app.APP_VERSION and "always-mp4" in app.APP_VERSION)
+check("version v42", "v42" in app.APP_VERSION and "always-mp4" in app.APP_VERSION)
 
 
 # ---- v39: engine pin must not drift across the four places it appears ----
@@ -564,6 +564,122 @@ check("zip enforces a byte budget", "ZIP_MAX_BYTES" in _zsrc and "budget - used 
 check("zip drops over-budget image whole (no truncated file)",
       "truncated = True" in _zsrc and "TRUNCATED.txt" in _zsrc)
 check("zip validates each photo URL", "_validate_egress(p[\"url\"])" in _zsrc)
+
+
+# ---- v41: buffered path (turbo / SponsorBlock) parity with streaming ----
+
+# BUG: c: and m: produced the SAME selector, so the buffered path silently
+# dropped the H.264 constraint. `c:` exists only to guarantee a
+# QuickTime-playable file; turbo used to hand back VP9/AV1 with no warning.
+_c = app._sb_selector("c:1080", {}, "")
+_m = app._sb_selector("m:1080", {}, "")
+check("compat and merge selectors are no longer identical", _c != _m)
+check("c: constrains EVERY branch to avc1",
+      all("vcodec^=avc1" in b for b in _c.split("/")))
+check("c: has no bare quality fallback (streaming path 404s there)",
+      "best[height<=1080]" not in [b.strip() for b in _c.split("/")])
+check("c: prefers AAC audio for a pure-copy mux", "acodec^=mp4a" in _c)
+
+# codec=h264 (the QuickTime UI toggle) must reach the buffered path too
+_mq = app._sb_selector("m:1080", {}, "h264")
+check("codec=h264 makes m: prefer avc1", _mq.split("/")[0].count("vcodec^=avc1") == 1)
+check("m:+h264 still falls back to best quality (matches streaming branch)",
+      any("vcodec^=avc1" not in b for b in _mq.split("/")))
+check("plain m: is quality-over-codec (no avc1 constraint)",
+      "vcodec^=avc1" not in _m)
+
+# exact height first, so buffered doesn't silently hand back a lower res
+for _k, _c2 in [("c:1080", ""), ("m:1080", "h264"), ("m:720", "")]:
+    check(f"{_k} tries exact height first",
+          app._sb_selector(_k, {}, _c2).split("/")[0].count("height=") == 1)
+
+check("p: passes the format id straight through", app._sb_selector("p:137", {}, "") == "137")
+check("audio kinds unaffected", app._sb_selector("mp3", {}, "h264") == "bestaudio")
+
+# codec must actually be threaded through the dispatch
+import inspect as _insp
+_sig = _insp.signature(app._sb_selector).parameters
+check("_sb_selector accepts codec", "codec" in _sig)
+_disp = _insp.getsource(app.api_download)
+check("dispatch passes codec to the selector", "_sb_selector(kind, info, codec)" in _disp)
+
+# buffered failures must be real HTTP errors, not an empty 200
+_fd = _insp.getsource(app._file_download)
+check("_file_download is async (prepares before responding)",
+      _insp.iscoroutinefunction(app._file_download))
+check("buffered failure raises instead of ending the generator",
+      "raise HTTPException(502" in _fd)
+check("prepare happens outside the response generator",
+      _fd.index("create_subprocess_exec") < _fd.index("async def gen()"))
+check("temp dir cleaned up when prepare fails",
+      "except BaseException" in _fd and "rmtree" in _fd)
+
+# turbo/sb + clip is now explicit, not silently dropped
+check("clip + buffered rejected explicitly",
+      "cannot be combined with clipping" in _disp)
+_ui = pathlib.Path("backend/static/index.html").read_text()
+check("UI stops sending turbo/sb when clipping",
+      "const bufQS = clip ?" in _ui)
+
+
+# ---- v42: turbo connection budget + scratch storage ----
+
+# THE BUG: aria2c ran -x16 -j16 per download with nothing coordinating lanes,
+# so 3 batch lanes = 48 connections to one CDN and 6 = 96. Since each
+# connection is throttled ~2-4 MB/s, 16 already saturates a typical link on ONE
+# video -- the extra connections bought no throughput and just multiplied
+# block risk. The budget is now shared, so total stays ~constant.
+_totals = []
+for _n in range(1, 8):
+    _c = app._turbo_conns(_n)
+    _totals.append(_c * min(_n, app.TURBO_LANES))
+check("total turbo connections stay bounded regardless of lanes",
+      max(_totals) <= app.TURBO_CONN_BUDGET + app.TURBO_MIN_CONNS)
+check("single turbo download still gets the full budget",
+      app._turbo_conns(1) == app.TURBO_CONN_BUDGET)
+check("connections shrink as lanes grow",
+      app._turbo_conns(1) > app._turbo_conns(2) > app._turbo_conns(4) - 1)
+check("never drops below the useful floor",
+      all(app._turbo_conns(n) >= app.TURBO_MIN_CONNS for n in range(1, 50)))
+check("lane cap keeps every lane above the floor",
+      app.TURBO_CONN_BUDGET // max(1, app.TURBO_LANES) >= app.TURBO_MIN_CONNS)
+check("turbo lanes are capped independently of MAX_CONCURRENCY",
+      app.turbo_sem._value == app.TURBO_LANES)
+
+# connection count must reach the aria2c args, not be hardcoded
+import inspect as _i2
+_fdsrc = _i2.getsource(app._file_download)
+check("aria2c args are built from the budget, not hardcoded 16",
+      "-x{conns}" in _fdsrc and "-x16" not in _fdsrc)
+check("turbo slot acquired before the main slot (consistent lock order)",
+      _fdsrc.index("async with turbo_sem") < _fdsrc.index("await _prepare()"))
+check("active counter decremented in finally",
+      "_turbo_active -= 1" in _fdsrc and "finally:" in _fdsrc)
+
+# scratch storage must be separate from the RAM tmpfs holding merge FIFOs
+check("buffered downloads use the scratch root",
+      "dir=_scratch_root()" in _fdsrc)
+check("_scratch_root returns a writable dir", os.access(app._scratch_root(), os.W_OK))
+check("scratch falls back rather than raising", isinstance(app._scratch_root(), str))
+check("out-of-space is reported as 507, not a generic failure",
+      "507" in _fdsrc and "ENOSPC" in _fdsrc)
+
+_k8s = pathlib.Path("k8s/deployment.yaml").read_text()
+check("k8s mounts a separate scratch volume", "name: scratch" in _k8s)
+check("k8s scratch is DISK-backed (no medium: Memory)",
+      "emptyDir: { sizeLimit: 8Gi }" in _k8s)
+check("k8s sets SCRATCH_DIR", "SCRATCH_DIR" in _k8s)
+check("k8s /tmp stays small and RAM-backed for FIFOs",
+      "medium: Memory, sizeLimit: 16Mi" in _k8s)
+
+# zip budget must fit under the shipped pod memory limit
+_zdefault = 64 * 1024 * 1024
+check("zip RAM budget default lowered to fit a 512Mi pod",
+      f"str({64} * 1024 * 1024)" in pathlib.Path("backend/app.py").read_text())
+check("k8s pins ZIP_MAX_BYTES explicitly", "ZIP_MAX_BYTES" in _k8s)
+
+check("health reports the turbo budget", "turbo_budget" in _i2.getsource(app.health))
+check("health reports the scratch dir", '"scratch"' in _i2.getsource(app.health))
 
 print(f"\nTOTAL {ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)

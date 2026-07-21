@@ -637,7 +637,11 @@ async function download(f, el){
   el.dataset.going = "1";
   const clip = $("clipOn").checked;
   const buffered = !clip && ($("turboOn").checked || $("sbOn").checked);  // server prepares first
-  const href = "/api/download?url="+encodeURIComponent(currentUrl)+"&kind="+encodeURIComponent(f.kind)+clipQS()+sbQS()+turboQS()+codecQS()+keyQS();
+  // Turbo/SponsorBlock are mutually exclusive with clipping (the server now
+  // rejects the pair instead of silently ignoring them), so don't send them
+  // when a clip is requested — clipping is what the user asked for last.
+  const bufQS = clip ? "" : (sbQS() + turboQS());
+  const href = "/api/download?url="+encodeURIComponent(currentUrl)+"&kind="+encodeURIComponent(f.kind)+clipQS()+bufQS+codecQS()+keyQS();
   const meta = el.querySelector(".m"), orig = meta.innerHTML, bar = el.querySelector(".prog i");
   const clear = () => { delete el.dataset.going; };
   const outExt = buffered ? ((f.kind === "mp3" || f.kind.startsWith("a:")) ? "mp3" : "mp4") : f.ext;

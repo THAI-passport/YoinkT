@@ -19,6 +19,17 @@ spec:
           env:
             - name: MAX_CONCURRENCY
               value: "4"
+            # Buffered downloads (Turbo / SponsorBlock) write the WHOLE video
+            # file. They must NOT land on the RAM-backed /tmp below — see the
+            # scratch volume. Without this they fail on any video over
+            # /tmp's sizeLimit.
+            - name: SCRATCH_DIR
+              value: /scratch
+            # Carousel zips are built in memory, so this budget competes
+            # directly with the pod memory limit further down. Keep it well
+            # under that limit (peak is roughly budget + one image + runtime).
+            - name: ZIP_MAX_BYTES
+              value: "67108864"   # 64 MiB
             # Datacenter IPs get bot-blocked by YouTube. Enable ONE of these:
             # - name: PROXY_URL
             #   valueFrom:
@@ -30,6 +41,15 @@ spec:
             # RAM-backed, tiny (pipes hold no media), keeps pods stateless.
             - name: tmp
               mountPath: /tmp
+            # Buffered downloads (Turbo / SponsorBlock) need REAL DISK: they
+            # write the entire video before streaming it back. This is a
+            # separate volume from /tmp on purpose — the two have opposite
+            # requirements, and sharing them broke Turbo for any video larger
+            # than /tmp's 16Mi. Do NOT set medium: Memory here: tmpfs pages
+            # count against the pod memory limit, so a big download would
+            # OOMKill the pod instead of returning a disk error.
+            - name: scratch
+              mountPath: /scratch
           #   - name: cookies
           #     mountPath: /secrets
           #     readOnly: true
@@ -49,8 +69,14 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
       volumes:
+        # FIFOs only — bytes flow through, nothing accumulates. RAM is right.
         - name: tmp
           emptyDir: { medium: Memory, sizeLimit: 16Mi }
+        # Whole-video staging for Turbo / SponsorBlock. Node disk, NOT memory.
+        # Size for (largest video x MAX_CONCURRENCY) with headroom; 8Gi covers
+        # four simultaneous long 1080p downloads. Raise for 4K or more lanes.
+        - name: scratch
+          emptyDir: { sizeLimit: 8Gi }
       #   - name: cookies
       #     secret: { secretName: YoinkT-cookies }
 ---

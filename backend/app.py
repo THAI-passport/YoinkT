@@ -75,7 +75,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-APP_VERSION = "YoinkT v40-always-mp4-egress"  # bump on behavior changes; shown in UI footer
+APP_VERSION = "YoinkT v42-always-mp4-budget"  # bump on behavior changes; shown in UI footer
 # NOTE: keep the substring "always-mp4" — run-local.sh greps for it
 
 PROXY_URL = os.environ.get("PROXY_URL") or None
@@ -120,6 +120,39 @@ CONCURRENT_FRAGMENTS = int(os.environ.get("CONCURRENT_FRAGMENTS", "16"))
 # dodge for them. Set "0" to disable if CDN starts 403ing ranged requests.
 HTTP_CHUNK_SIZE = os.environ.get("HTTP_CHUNK_SIZE", "10M")
 
+# ---- scratch storage --------------------------------------------------------
+# /tmp and the buffered download path want OPPOSITE things and must not share a
+# volume. The streaming merge path puts named pipes in /tmp: bytes flow through
+# them, nothing accumulates, so a tiny RAM-backed tmpfs is exactly right. The
+# buffered path (turbo, SponsorBlock) writes the WHOLE video file — hundreds of
+# MB — because aria2c can't pipe to stdout and SponsorBlock cuts a finished file.
+#
+# On the shipped k8s manifest /tmp was `emptyDir: {medium: Memory, sizeLimit:
+# 16Mi}`, so every turbo/SponsorBlock download of a video larger than 16 MiB
+# failed there; raising that limit would have been worse, since tmpfs pages are
+# charged to the pod's memory cgroup and the failure becomes an OOMKill instead
+# of a disk error. Docker and native runs never showed it — both give /tmp real
+# disk. So: buffered downloads get their own DISK-backed directory.
+SCRATCH_DIR = os.environ.get("SCRATCH_DIR") or tempfile.gettempdir()
+
+# ---- turbo connection budget ------------------------------------------------
+# aria2c opens many parallel connections because the platform throttles each one
+# (~2-4 MB/s). 16 connections is therefore ~32-64 MB/s ~= 256-512 Mbps, which
+# already saturates a typical link with a SINGLE download. Running N batch lanes
+# at 16 each does NOT multiply throughput — the bottleneck has moved to the
+# user's own pipe — it just multiplies the connection count against one CDN,
+# which is the pattern that trips rate-limiting and bot-detection.
+#
+# So the right total is a CONSTANT ("enough to saturate the link"), not something
+# that scales with lanes: divide a fixed budget across whatever is in flight.
+# Counted server-side rather than from a client-supplied lane count, so it also
+# holds across multiple tabs and multiple users, and can't be lied about.
+TURBO_CONN_BUDGET = int(os.environ.get("TURBO_CONN_BUDGET", "16"))
+# Floor: below ~4 connections aria2c's advantage collapses (each is throttled)
+# and you pay turbo's buffering cost for nothing. Better to queue a lane than
+# run it so degraded that turbo is pointless.
+TURBO_MIN_CONNS = int(os.environ.get("TURBO_MIN_CONNS", "4"))
+
 # ---- stealth profiles -------------------------------------------------------
 # Some platforms fingerprint the TLS handshake, not just the User-Agent: a
 # stock Python HTTPS client is identifiable as "not a browser" before a single
@@ -152,6 +185,32 @@ STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
 app = FastAPI(title="YoinkT", docs_url=None, redoc_url=None)
 sem = asyncio.Semaphore(MAX_CONCURRENCY)
+# Turbo lanes are capped so every running one still clears TURBO_MIN_CONNS out
+# of the shared budget; lane N+1 queues instead of running degraded.
+TURBO_LANES = max(1, TURBO_CONN_BUDGET // max(1, TURBO_MIN_CONNS))
+turbo_sem = asyncio.Semaphore(TURBO_LANES)
+_turbo_active = 0  # in-flight turbo prepares; drives the per-download split
+
+
+def _turbo_conns(active: int) -> int:
+    """Connections for one turbo download, given how many are running."""
+    return max(TURBO_MIN_CONNS, TURBO_CONN_BUDGET // max(1, active))
+
+
+def _scratch_root() -> str:
+    """Writable directory for buffered downloads. Falls back to the system temp
+    dir with a warning rather than failing the request — a misconfigured
+    SCRATCH_DIR should degrade to the old behavior, not break turbo."""
+    try:
+        os.makedirs(SCRATCH_DIR, exist_ok=True)
+        if os.access(SCRATCH_DIR, os.W_OK):
+            return SCRATCH_DIR
+        log.warning("SCRATCH_DIR %s not writable; using %s",
+                    SCRATCH_DIR, tempfile.gettempdir())
+    except Exception as e:
+        log.warning("SCRATCH_DIR %s unusable (%s); using %s",
+                    SCRATCH_DIR, e, tempfile.gettempdir())
+    return tempfile.gettempdir()
 
 # naive per-IP token bucket: ip -> [window_start_epoch, count]. Per-process, so
 # on k8s each pod counts separately (approximate) — good enough as an abuse
@@ -1182,6 +1241,13 @@ async def health():
     return {"ok": True, "version": APP_VERSION,
             "max_concurrency": MAX_CONCURRENCY,
             "turbo": bool(shutil.which("aria2c")),
+            # Surfaced so a slow bulk run can be diagnosed without guessing:
+            # connections are a shared budget, not per-lane.
+            "turbo_budget": {"total_connections": TURBO_CONN_BUDGET,
+                             "min_per_download": TURBO_MIN_CONNS,
+                             "lanes": TURBO_LANES,
+                             "active": _turbo_active},
+            "scratch": _scratch_root(),
             "js_runtime": bool(shutil.which("deno") or shutil.which("node")),
             "pot": bool(PO_TOKEN or POT_PROVIDER_URL),
             "proxy": bool(PROXY_URL), "cookies": bool(COOKIES_FILE),
@@ -1613,19 +1679,51 @@ def _range_proxy(direct_url: str, request: Request, filename: str,
                              media_type=media_type, headers=headers)
 
 
-def _sb_selector(kind: str, info: dict) -> str:
-    """Map a YoinkT kind to a yt-dlp format selector for the SponsorBlock path
-    (yt-dlp owns the whole download+merge+cut pipeline there)."""
+def _sb_selector(kind: str, info: dict, codec: str = "") -> str:
+    """Map a YoinkT kind to a yt-dlp format selector for the buffered path
+    (turbo / SponsorBlock — yt-dlp owns the whole download+merge+cut pipeline
+    there, so the format choice has to be expressed as a selector string
+    instead of the explicit format IDs the streaming path picks).
+
+    MUST mirror the streaming path's codec policy. It previously did not:
+    `c:1080` and `m:1080` both returned `bestvideo[height<=1080]+bestaudio`,
+    which silently discarded the H.264 constraint. `c:` exists ONLY to
+    guarantee a QuickTime-playable file, and `codec=h264` is the same promise
+    from the UI toggle — so turbo produced VP9/AV1 files that QuickTime can't
+    open, with no warning."""
     if kind.startswith("p:"):
         return kind[2:]
     if kind.startswith(("m:", "c:")):
         h = int(kind[2:])
-        return f"bestvideo[height<={h}]+bestaudio/best[height<={h}]"
+        strict = kind.startswith("c:")       # compat kind: H.264 or nothing
+        want_avc = strict or codec == "h264"  # UI toggle: H.264 preferred
+        if want_avc:
+            # exact height first, then any height <= h — matching the
+            # streaming path, which looks for avc1 at exactly this height
+            chain = [
+                f"bestvideo[height={h}][vcodec^=avc1]+bestaudio[acodec^=mp4a]",
+                f"bestvideo[height={h}][vcodec^=avc1]+bestaudio",
+                f"bestvideo[height<={h}][vcodec^=avc1]+bestaudio",
+                f"best[height<={h}][vcodec^=avc1]",
+            ]
+            if not strict:
+                # m:+codec=h264 falls back to best-quality when no H.264
+                # exists at all, exactly like the streaming branch does.
+                # c: does NOT: the streaming path 404s there, and a silent
+                # non-H.264 file is precisely the bug being fixed.
+                chain += [f"bestvideo[height={h}]+bestaudio",
+                          f"bestvideo[height<={h}]+bestaudio",
+                          f"best[height<={h}]"]
+            return "/".join(chain)
+        # quality over codec (streaming path's default): prefer the exact
+        # height, let yt-dlp's own sort pick the best codec at it
+        return (f"bestvideo[height={h}]+bestaudio/"
+                f"bestvideo[height<={h}]+bestaudio/best[height<={h}]")
     return "bestaudio"
 
 
-def _file_download(url: str, selector: str, name: str, audio_only: bool,
-                   sb: bool, turbo: bool, site: str = "youtube") -> StreamingResponse:
+async def _file_download(url: str, selector: str, name: str, audio_only: bool,
+                         sb: bool, turbo: bool, site: str = "youtube") -> StreamingResponse:
     """Buffered download path for options that CAN'T stream:
       - turbo: aria2c opens many parallel connections (each gets its own
         YouTube throttle allowance) -> much faster single downloads, but
@@ -1635,44 +1733,102 @@ def _file_download(url: str, selector: str, name: str, audio_only: bool,
     delete it. NOT zero-storage — needs real disk in /tmp (k8s: size the tmp
     emptyDir well above 16Mi). Both options combine."""
 
-    async def gen():
-        async with sem:
-            tmp = tempfile.mkdtemp(prefix="ytgrab-dl-")
-            outtmpl = os.path.join(tmp, "out.%(ext)s")
-            cmd = ["yt-dlp", *_base_flags(site), "-f", selector, "-o", outtmpl]
+    # PREPARE FIRST, then respond. This used to run inside the response
+    # generator, which meant the 200 and Content-Disposition were already on
+    # the wire before yt-dlp ran — so any failure ended the generator and the
+    # client received a correctly-named, completely EMPTY .mp4 with no error
+    # at all. Every turbo/SponsorBlock failure was invisible.
+    #
+    # This path is fully buffered by nature (aria2c can't pipe to stdout;
+    # SponsorBlock cuts the finished file), so the client is waiting either
+    # way — doing the work before the response costs no extra latency and
+    # buys real HTTP status codes. Long prepares need the same generous
+    # ingress read timeouts the streaming paths already require.
+    # DISK-backed scratch, never the RAM tmpfs that holds the merge FIFOs —
+    # this writes the whole video (see SCRATCH_DIR).
+    tmp = tempfile.mkdtemp(prefix="ytgrab-dl-", dir=_scratch_root())
+
+    def _build_cmd(conns: int) -> list[str]:
+        outtmpl = os.path.join(tmp, "out.%(ext)s")
+        c = ["yt-dlp", *_base_flags(site), "-f", selector, "-o", outtmpl]
+        if turbo:
+            # -x/-j scale with the shared budget; -s matches -x so a single
+            # file is actually split that many ways. file-allocation=none
+            # starts instantly, min-split-size=1M keeps every connection busy.
+            c += ["--downloader", "aria2c",
+                  "--downloader-args",
+                  f"aria2c:-x{conns} -s{conns} -k1M -j{conns} "
+                  "--min-split-size=1M --file-allocation=none "
+                  "--optimize-concurrent-downloads=true"]
+        else:
+            c += ["--concurrent-fragments", str(CONCURRENT_FRAGMENTS)]
+        if sb:
+            c += ["--sponsorblock-remove", "default"]
+        if audio_only:
+            c += ["-x", "--audio-format", "mp3"]
+        else:
+            c += ["--merge-output-format", "mp4", "--remux-video", "mp4"]
+        return c + [url]
+
+    async def _prepare() -> None:
+        """Run the download. Raises HTTPException on failure."""
+        global _turbo_active
+        conns = CONCURRENT_FRAGMENTS
+        if turbo:
+            _turbo_active += 1
+            conns = _turbo_conns(_turbo_active)
+            log.info("turbo prepare: %d connection(s), %d active",
+                     conns, _turbo_active)
+        try:
+            # Slot held for the PREPARE only — that's the expensive part, and
+            # unlike the streaming paths it happens in the handler rather than
+            # the generator. Streaming the finished file back is disk->socket
+            # and cheap. Aggregate scratch usage is still uncapped (P2).
+            async with sem:
+                proc = await asyncio.create_subprocess_exec(
+                    *_build_cmd(conns), stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE, cwd=tmp)
+                _, err = await proc.communicate()
+        finally:
             if turbo:
-                # -x16 conns/server, -s16 splits, -k1M piece, -j16 parallel;
-                # file-allocation=none starts instantly (no preallocation),
-                # min-split-size=1M keeps all 16 connections busy on one file.
-                cmd += ["--downloader", "aria2c",
-                        "--downloader-args",
-                        "aria2c:-x16 -s16 -k1M -j16 --min-split-size=1M "
-                        "--file-allocation=none --optimize-concurrent-downloads=true"]
-            else:
-                cmd += ["--concurrent-fragments", str(CONCURRENT_FRAGMENTS)]
-            if sb:
-                cmd += ["--sponsorblock-remove", "default"]
-            if audio_only:
-                cmd += ["-x", "--audio-format", "mp3"]
-            else:
-                cmd += ["--merge-output-format", "mp4", "--remux-video", "mp4"]
-            cmd += [url]
-            proc = await asyncio.create_subprocess_exec(
-                *cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, cwd=tmp)
-            _, err = await proc.communicate()
-            try:
-                files = [f for f in os.listdir(tmp) if f.startswith("out.")]
-                if proc.returncode != 0 or not files:
-                    msg = err.decode(errors="replace").strip()[-400:] if err else "no output"
-                    log.error("buffered download failed (turbo=%s sb=%s): %s",
-                              turbo, sb, msg)
-                    return
-                path = os.path.join(tmp, files[0])
-                with open(path, "rb") as fh:
-                    while chunk := await asyncio.to_thread(fh.read, 256 * 1024):
-                        yield chunk
-            finally:
-                shutil.rmtree(tmp, ignore_errors=True)
+                _turbo_active -= 1
+        files = [f for f in os.listdir(tmp) if f.startswith("out.")]
+        if proc.returncode != 0 or not files:
+            msg = (err.decode(errors="replace").strip()[-400:] if err
+                   else "produced no output")
+            log.error("buffered download failed (turbo=%s sb=%s): %s",
+                      turbo, sb, msg)
+            mode = " + ".join(m for m, on in
+                              (("Turbo", turbo), ("SponsorBlock", sb)) if on)
+            if "No space left" in msg or "ENOSPC" in msg:
+                raise HTTPException(
+                    507, f"{mode} ran out of scratch space in {_scratch_root()}. "
+                         "On Kubernetes give the pod a disk-backed volume and "
+                         "point SCRATCH_DIR at it.")
+            raise HTTPException(502, f"{mode} download failed: {msg}")
+
+    try:
+        if turbo:
+            # Lane cap: every running turbo download still clears
+            # TURBO_MIN_CONNS out of the shared budget. Acquired BEFORE sem,
+            # consistently, so the two semaphores can't deadlock.
+            async with turbo_sem:
+                await _prepare()
+        else:
+            await _prepare()
+        path = os.path.join(tmp, [f for f in os.listdir(tmp)
+                                  if f.startswith("out.")][0])
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+
+    async def gen():
+        try:
+            with open(path, "rb") as fh:
+                while chunk := await asyncio.to_thread(fh.read, 1024 * 1024):
+                    yield chunk
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     ext = "mp3" if audio_only else "mp4"
     mt = "audio/mpeg" if audio_only else "video/mp4"
@@ -1737,7 +1893,11 @@ async def api_download(
             # the actual exposure, so cap the bytes too and stop early rather
             # than let one carousel of full-resolution images decide how much
             # memory the process uses.
-            budget = int(os.environ.get("ZIP_MAX_BYTES", str(256 * 1024 * 1024)))
+            # 64 MiB, not 256: this blob is held in RAM, and the shipped k8s
+            # pod limit is 512Mi. A 256 MiB zip plus one in-flight image plus
+            # the interpreter would OOMKill the pod rather than degrade.
+            # Raise it deliberately alongside the memory limit, not by default.
+            budget = int(os.environ.get("ZIP_MAX_BYTES", str(64 * 1024 * 1024)))
             opener = _egress_opener()
             buf = io.BytesIO()
             # STORED (no compression): images are already compressed, and stored
@@ -1825,11 +1985,21 @@ async def api_download(
                "-f", "best", "-o", "-", url]
         return await _stream_proc(cmd, "video/mp4", f"{name}_video{n}.mp4")
 
-    # buffered path (can't stream): turbo (aria2c) and/or SponsorBlock. Not for clips.
-    if (sb or turbo) and not clip:
+    # buffered path (can't stream): turbo (aria2c) and/or SponsorBlock.
+    # Neither combines with clipping — clipping is an ffmpeg stream-copy of a
+    # time range, the buffered path hands the whole pipeline to yt-dlp. This
+    # used to fall through silently to the clip path with turbo/sb quietly
+    # dropped; say so instead of pretending the option was honoured.
+    if (sb or turbo) and clip:
+        opts = " and ".join(m for m, on in
+                            (("Turbo", turbo), ("SponsorBlock", sb)) if on)
+        raise HTTPException(
+            400, f"{opts} cannot be combined with clipping — "
+                 "download the clip without it, or the full video with it.")
+    if sb or turbo:
         audio_only = kind in ("mp3", "a:audio")
-        return _file_download(url, _sb_selector(kind, info), name,
-                              audio_only, bool(sb), bool(turbo), site=site)
+        return await _file_download(url, _sb_selector(kind, info, codec), name,
+                                    audio_only, bool(sb), bool(turbo), site=site)
 
     if kind == "mp3":  # transcode best audio -> streamable MP3
         audio = [f for f in (info.get("formats") or [])
