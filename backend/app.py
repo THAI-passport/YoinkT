@@ -75,7 +75,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-APP_VERSION = "YoinkT v44-always-mp4-meta"  # bump on behavior changes; shown in UI footer
+APP_VERSION = "YoinkT v45-always-mp4-nocookie"  # bump on behavior changes; shown in UI footer
 # NOTE: keep the substring "always-mp4" — run-local.sh greps for it
 
 PROXY_URL = os.environ.get("PROXY_URL") or None
@@ -581,6 +581,10 @@ def _ydl_opts(site: str = "youtube") -> dict:
     if ck:
         opts["cookiefile"] = ck
     ea = _extractor_args_dict()  # namespaced per-extractor; harmless off-youtube
+    clients = _yt_fallback_clients(site)
+    if clients:
+        ea = {**ea, "youtube": {**(ea.get("youtube") or {}),
+                                "player_client": clients}}
     if ea:
         opts["extractor_args"] = ea
     prof = _stealth_for(site)
@@ -600,6 +604,37 @@ def _ydl_opts(site: str = "youtube") -> dict:
 # still sometimes works. Real fix is cookies (a throwaway Google account is
 # fine — the cookie need only prove "logged in", not be your main account).
 _YT_AGE_CLIENTS = os.environ.get("YT_AGE_CLIENTS", "default,tv,mweb,web_safari")
+
+# Cookie-free, PO-token-free YouTube. The default `web` client now demands a PO
+# token and throws "Sign in to confirm you're not a bot" without one. The `tv`
+# and `ios` player clients use a different auth path that frequently still works
+# token-free. So when the instance has NEITHER cookies NOR a PO token — the
+# degraded state where `web` is unreliable — YoinkT uses these clients for
+# BOTH extraction AND download. It must be both: if extraction used `tv` but the
+# merge download used `web`, the download would hit the wall the extract dodged.
+#
+# Applied proactively rather than as a retry, precisely so the two stay in sync.
+# When cookies or a PO token ARE present, this is skipped and the full-speed
+# `web` client is used as before.
+#
+# HONEST: a moving target. YouTube closes these paths periodically; which
+# clients work shifts month to month, so it's an env list you can retune. `tv`
+# is currently the most reliable token-free client, `ios` the backup. These
+# clients can be slower or offer fewer formats than `web` — a slower download
+# beats a bot wall. Set YT_BOT_CLIENTS="" to force pure `web` (the old behavior)
+# if you have a residential IP where `web` works token-free.
+_YT_BOT_CLIENTS = os.environ.get("YT_BOT_CLIENTS", "tv,ios,mweb")
+
+
+def _yt_fallback_clients(site: str) -> list[str]:
+    """Token-free player clients to use for YouTube when we have no cookies and
+    no PO token — [] otherwise (full-speed web client). Single source of truth
+    for both the Python-API extract path and the CLI download paths, so they
+    can never disagree about which client the URLs came from."""
+    if (site == "youtube" and _YT_BOT_CLIENTS.strip()
+            and not _cookies_for("youtube") and not _POT_ON):
+        return [c.strip() for c in _YT_BOT_CLIENTS.split(",") if c.strip()]
+    return []
 
 
 def _is_age_error(e: Exception) -> bool:
@@ -1485,6 +1520,9 @@ async def health():
             # common cause of "it worked yesterday" — surface it here so it's
             # one curl away instead of a guess.
             "engine": eng,
+            # which YouTube player clients are in use: [] = full-speed web
+            # (cookies or PO token present); a list = token-free fallback.
+            "yt_clients": _yt_fallback_clients("youtube") or ["web"],
             "stealth": {"available": _stealth_available(),
                         "profiles": {s: _stealth_for(s)
                                      for s in sorted(ENABLED_SITES & SITE_RES.keys())}},
@@ -1751,6 +1789,12 @@ def _base_flags(site: str = "youtube") -> list[str]:
     if prof:
         flags += ["--impersonate", prof]
     flags += _extractor_args_cli()
+    # Same token-free player clients the extract path chose, so the download
+    # workers request the SAME formats. Without this the merge download would
+    # use the default `web` client and hit the exact bot wall extraction dodged.
+    clients = _yt_fallback_clients(site)
+    if clients:
+        flags += ["--extractor-args", f"youtube:player_client={','.join(clients)}"]
     return flags
 
 

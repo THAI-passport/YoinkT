@@ -78,24 +78,23 @@ Known limit: this validates before connecting, so DNS rebinding (a name that res
 
 ### Engine freshness
 
-The extraction engine rots — platforms change their internals and a build from last month stops working. It's the single most common cause of "it worked yesterday".
+The extraction engine rots — platforms change their internals and a build from last month stops working. It's the single most common cause of "it worked yesterday". For a downloader this isn't just a slowdown: a stale engine gets bot-challenged by YouTube and stops working entirely.
 
-The image **pins its engine build on purpose.** Freshness only pays off when extraction actually breaks, whereas every engine bump is a throughput risk — this project has already lost half its 1080p speed once to an engine-side client change. So moving forward is a decision, not a default:
+So the image **tracks the latest engine build by default**, and a pin is the escape hatch for when a specific new build regresses:
 
 ```bash
-docker build .                                      # pinned (default)
-docker build --build-arg ENGINE_VERSION=2026.8.1 .  # a specific build
-docker build --build-arg ENGINE_VERSION="" .        # latest, incl. same-day builds
+docker build .                                      # latest (default)
+docker build --build-arg ENGINE_VERSION=2026.8.1 .  # pin a specific build
 ```
 
-What earns the right to pin is the rest of the setup:
+`ENGINE_VERSION` (a file at the repo root, also the compose/CI value) is the single source of truth; `latest` means newest, a version string pins.
 
-- **CI runs a weekly nightly canary** — the same test suite against the newest engine build. It never gates the build; a red canary means "look before you bump".
-- **`GET /api/health` reports the shipped build**, its age in days, and a `stale` flag past `ENGINE_STALE_DAYS` (default 21). Reporting only, nothing is blocked.
+- **CI runs the suite against the latest build** (what ships) and a non-gating floor-check against the requirements minimum.
+- **`GET /api/health` reports the resolved build**, its age in days, and a `stale` flag past `ENGINE_STALE_DAYS` (default 21) — so if you *do* pin and it drifts, it's visible.
 
 ```bash
 curl -s localhost:8000/api/health | python -m json.tool
-# "engine": {"version": "2026.7.4", "age_days": 16, "stale": false, "channel": "stable", ...}
+# "engine": {"version": "2026.7.20", "age_days": 3, "stale": false, "channel": "nightly", ...}
 ```
 
 When extraction starts failing on a site, that's the signal to bump the pin — not the calendar.

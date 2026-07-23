@@ -261,9 +261,16 @@ check("age err: confirm your age", app._is_age_error(_AgeErr("Sign in to confirm
 check("age err: inappropriate", app._is_age_error(_AgeErr("inappropriate for some users")))
 check("age err: not a normal error", not app._is_age_error(_AgeErr("HTTP Error 404: Not Found")))
 check("age clients include mweb", "mweb" in app._YT_AGE_CLIENTS and app._YT_AGE_CLIENTS.startswith("default"))
-# youtube CLI merge (no cookies) injects the bypass clients; other sites don't
+# v38 speed fix: the full-speed `web` client (no forced player_client) is kept
+# whenever a working setup exists (cookies OR PO token). v45 only forces the
+# token-free clients in the DEGRADED state (neither), where web is walled anyway
+# so there is no speed to protect.
+_sv_pot38 = app._POT_ON
+app._POT_ON = True  # simulate a working full-speed setup
 yt_flags = app._common_flags("youtube")
-check("yt cli merge NO forced player_client (v38 speed fix)", not any("player_client=" in f for f in yt_flags))
+check("yt cli merge keeps web client when PO token present (v38 speed fix)",
+      not any("player_client=" in f for f in yt_flags))
+app._POT_ON = _sv_pot38
 x_flags = app._common_flags("x")
 check("x cli merge no player_client", not any("player_client=" in f for f in x_flags))
 check("version bumped", app.APP_VERSION.startswith("YoinkT v"))
@@ -355,7 +362,7 @@ check("gdl config flag is list", isinstance(app._gdl_config_flag(), list))
 check("gdl config flag empty or known",
       app._gdl_config_flag() in ([], ["--ignore-config"], ["--config-ignore"]))
 
-check("version v44", "v44" in app.APP_VERSION and "always-mp4" in app.APP_VERSION)
+check("version v45", "v45" in app.APP_VERSION and "always-mp4" in app.APP_VERSION)
 
 
 # ---- v39: engine pin must not drift across the four places it appears ----
@@ -366,7 +373,8 @@ check("version v44", "v44" in app.APP_VERSION and "always-mp4" in app.APP_VERSIO
 import re as _re, pathlib as _pl
 _root = _pl.Path(__file__).resolve().parent.parent
 _pin = (_root / "ENGINE_VERSION").read_text().strip()
-check("ENGINE_VERSION file looks like a build", bool(_re.fullmatch(r"\d{4}\.\d{1,2}\.\d{1,2}(\.\d+)?", _pin)))
+check("ENGINE_VERSION file is 'latest' or a build",
+      _pin == "latest" or bool(_re.fullmatch(r"\d{4}\.\d{1,2}\.\d{1,2}(\.\d+)?", _pin)))
 
 _df = _re.search(r"ARG ENGINE_VERSION=(\S*)", (_root / "Dockerfile").read_text())
 check("Dockerfile pin matches ENGINE_VERSION", _df and _df.group(1).strip('"') == _pin)
@@ -820,6 +828,76 @@ check("UI formats dates", "const fdate" in _ui)
 check("UI shows a description box", 'id="descbox"' in _ui and 'id="desctext"' in _ui)
 check("UI calls renderStats on load", "renderStats(d);" in _ui)
 check("stat row hidden when no chips", "row.style.display = C.length" in _ui)
+
+
+# ---- v44 hotfix: error detail is an object, UI must not show [object Object] ----
+# _classify_error returns detail={hint, raw}; the frontend read `.detail` as a
+# string, so EVERY error rendered as "[object Object]" and masked the real
+# cause. Regression guard: no fetch handler may read `.detail` raw again.
+_ui = pathlib.Path("backend/static/index.html").read_text()
+check("UI has an error-detail normaliser", "async function errText(r)" in _ui)
+check("errText handles string detail", 'typeof d === "string"' in _ui)
+check("errText prefers the human hint", "d.hint || d.raw" in _ui)
+check("no fetch handler reads .detail as a bare string",
+      ".detail || r.statusText" not in _ui)
+check("all error sites route through errText", _ui.count("await errText(r)") >= 5)
+# the only surviving `.detail` read is inside errText itself
+check("detail is read in exactly one place now", _ui.count(".detail") == 1)
+
+# every taxonomy detail is a dict with a hint -> errText always finds text
+for _m in ["nsig extraction failed", "Sign in to confirm you're not a bot",
+           "rate-limit reached", "kwyjibo unrecognised thing"]:
+    _e = app._classify_error(Exception(_m), "youtube")
+    check(f"taxonomy detail has a hint for {_m[:24]!r}",
+          isinstance(_e.detail, dict) and bool(_e.detail.get("hint")))
+
+
+# ---- v45: cookie-free / PO-token-free YouTube via token-free player clients ----
+_sv_ck, _sv_sc, _sv_rt, _sv_pot = (app.COOKIES_FILE, dict(app.SITE_COOKIES),
+                                   dict(app.SITE_COOKIES_RUNTIME), app._POT_ON)
+app.COOKIES_FILE = None
+app.SITE_COOKIES = {k: None for k in app.SITE_COOKIES}
+app.SITE_COOKIES_RUNTIME = {}
+app._POT_ON = False
+
+# degraded state (no cookies, no PO token): token-free clients kick in
+_cl = app._yt_fallback_clients("youtube")
+check("degraded state uses token-free clients", _cl == ["tv", "ios", "mweb"])
+check("fallback is youtube-only", app._yt_fallback_clients("x") == [])
+check("extract path carries the clients",
+      app._ydl_opts("youtube")["extractor_args"]["youtube"]["player_client"] == _cl)
+check("download path carries the SAME clients (no split-brain)",
+      any("player_client=tv,ios,mweb" in f for f in app._base_flags("youtube")))
+check("extract and download clients agree",
+      app._ydl_opts("youtube")["extractor_args"]["youtube"]["player_client"]
+      == [c for f in app._base_flags("youtube") if "player_client=" in f
+          for c in f.split("player_client=")[1].split(",")])
+
+# a PO token restores the full-speed web client on BOTH paths
+app._POT_ON = True
+check("PO token -> no forced clients (web)", app._yt_fallback_clients("youtube") == [])
+check("PO token -> extract uses web",
+      "player_client" not in (app._ydl_opts("youtube").get("extractor_args", {}).get("youtube", {})))
+check("PO token -> download uses web",
+      not any("player_client" in f for f in app._base_flags("youtube")))
+app._POT_ON = False
+
+# cookies also restore web (the fast path) even without a PO token
+app.SITE_COOKIES = {**app.SITE_COOKIES, "youtube": "/tmp/yt.txt"}
+check("cookies -> no forced clients (web)", app._yt_fallback_clients("youtube") == [])
+app.SITE_COOKIES = {k: None for k in app.SITE_COOKIES}
+
+# empty env disables the whole mechanism (pure web, old behavior)
+_sv_env = app._YT_BOT_CLIENTS
+app._YT_BOT_CLIENTS = ""
+check("YT_BOT_CLIENTS='' forces pure web", app._yt_fallback_clients("youtube") == [])
+app._YT_BOT_CLIENTS = _sv_env
+
+check("health reports the active yt clients",
+      "yt_clients" in __import__("inspect").getsource(app.health))
+
+app.COOKIES_FILE, app.SITE_COOKIES, app.SITE_COOKIES_RUNTIME, app._POT_ON = (
+    _sv_ck, _sv_sc, _sv_rt, _sv_pot)
 
 print(f"\nTOTAL {ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)

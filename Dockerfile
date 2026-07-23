@@ -16,26 +16,24 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Extraction engine build. PINNED BY DEFAULT — this is a deliberate trade.
 #
-# Tracking same-day builds buys freshness, and freshness only pays off when a
-# platform change BREAKS extraction. CI already rebuilds weekly and runs a
-# nightly canary, so breakage gets caught there instead of here. Meanwhile
-# every engine bump is a throughput risk: this project has already lost half
-# its 1080p download speed once to an engine-side client change (v38 bug log).
-# Continuous churn on the download path is the wrong trade for a service whose
-# speed was tuned by hand.
+# DEFAULT: track the latest build. This reverses the earlier "pin by default"
+# decision after it caused a real outage: a pinned engine went stale and
+# YouTube began bot-challenging every request, because YouTube's anti-bot
+# internals change faster than a pin gets bumped. For a downloader, engine
+# FRESHNESS is a correctness property, not a nice-to-have — a stale engine
+# doesn't just run slower, it stops working. So freshness wins by default and
+# a pin is the escape hatch for when a specific new build regresses.
 #
-# So: ship a known-good build, and treat "move forward" as a decision, not a
-# default. /api/health reports the build and its age, which is what tells you
-# when to make that decision.
+#   docker build .                                       -> latest (this default)
+#   docker build --build-arg ENGINE_VERSION=2026.8.1 .   -> pin a specific build
 #
-#   docker build .                            -> pinned (this default)
-#   docker build --build-arg ENGINE_VERSION=2026.8.1 .   -> a specific build
-#   docker build --build-arg ENGINE_VERSION="" .         -> latest, incl. same-day
-ARG ENGINE_VERSION=2026.07.04
-RUN if [ -n "$ENGINE_VERSION" ]; then \
-      pip install --no-cache-dir "yt-dlp==${ENGINE_VERSION}"; \
-    else \
+# "latest" and "" both mean newest; a version string pins it. /api/health
+# reports the resolved build + age so a stale pin is visible.
+ARG ENGINE_VERSION=latest
+RUN if [ -z "$ENGINE_VERSION" ] || [ "$ENGINE_VERSION" = "latest" ]; then \
       pip install --no-cache-dir --pre --upgrade yt-dlp; \
+    else \
+      pip install --no-cache-dir "yt-dlp==${ENGINE_VERSION}"; \
     fi \
  && python -c "import yt_dlp.version as v; print('engine build:', v.__version__)"
 

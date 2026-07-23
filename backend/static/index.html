@@ -419,7 +419,7 @@ $("ckfile").onchange = async () => {
   try {
     const txt = await f.text();
     const r = await fetch("/api/cookies/" + cookieTargetSite, {method:"POST", body: txt});
-    if (!r.ok) throw new Error((await r.json().catch(()=>({}))).detail || r.statusText);
+    if (!r.ok) throw new Error(await errText(r));
     const h = await (await fetch("/api/health")).json();
     renderSiteBar(h);
   } catch (ex) {
@@ -475,6 +475,14 @@ $("url").addEventListener("input", () => {
 });
 
 const mb = n => n ? (n/1048576 >= 1024 ? (n/1073741824).toFixed(2)+" GB" : (n/1048576).toFixed(1)+" MB") : "size unknown";
+// FastAPI's error `detail` can be a string OR, since the error taxonomy, an
+// object {hint, raw}. Always render the human hint, never "[object Object]".
+async function errText(r){
+  let d; try { d = (await r.json()).detail; } catch { return r.statusText; }
+  if (d == null) return r.statusText;
+  if (typeof d === "string") return d;
+  return d.hint || d.raw || r.statusText;
+}
 const fdur = s => { if(!s) return ""; const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;
   return (h?h+":"+String(m).padStart(2,"0"):m)+":"+String(x).padStart(2,"0"); };
 // compact counts: 1234 -> "1.2K", 3400000 -> "3.4M"
@@ -649,8 +657,7 @@ async function blobGrab(href, name, onProgress, idleMs, dl){
   catch { clearTimeout(timer); if (dl && dl.cancelled) throw new DOMException("cancelled", "AbortError"); throw new Error("stalled before any data — retry"); }
   if (!r.ok) {
     clearTimeout(timer);
-    let msg = r.statusText;
-    try { msg = (await r.json()).detail || msg; } catch {}
+    let msg = await errText(r);
     throw new Error(msg);
   }
   const total = +r.headers.get("Content-Length") || 0;
@@ -729,7 +736,7 @@ async function download(f, el){
     if (!handle) { el.classList.remove("busy"); meta.innerHTML = orig; return; }
     const w = await handle.createWritable();
     const r = await fetch(href, {signal: dl.ctl.signal});
-    if (!r.ok) throw new Error((await r.json().catch(()=>({}))).detail || r.statusText);
+    if (!r.ok) throw new Error(await errText(r));
     const total = +r.headers.get("Content-Length") || f.filesize || 0;
     const reader = r.body.getReader();
     let got = 0, t0 = performance.now();
@@ -864,7 +871,7 @@ async function fetchInfo(u){
   document.body.classList.remove("idle");
   try {
     const r = await fetch("/api/info?url="+encodeURIComponent(u));
-    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    if (!r.ok) throw new Error(await errText(r));
     const d = await r.json();
     currentTitle = d.title;
     currentSite = d.site || "youtube";
@@ -969,7 +976,7 @@ async function loadPlaylist(u){
   document.body.classList.remove("idle");
   try {
     const r = await fetch("/api/playlist?url=" + encodeURIComponent(u));
-    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    if (!r.ok) throw new Error(await errText(r));
     const d = await r.json();
     plEntries = d.entries;
     const na = d.count - (d.available ?? d.count);
@@ -1024,7 +1031,7 @@ let jsInfoCache = new Map();  // url -> Promise<info>
 function getInfo(url){
   if (jsInfoCache.has(url)) return jsInfoCache.get(url);
   const p = fetch("/api/info?url=" + encodeURIComponent(url))
-    .then(async r => { if (!r.ok) throw new Error((await r.json()).detail || r.statusText); return r.json(); });
+    .then(async r => { if (!r.ok) throw new Error(await errText(r)); return r.json(); });
   p.catch(() => jsInfoCache.delete(url));  // don't cache failures
   jsInfoCache.set(url, p);
   return p;
