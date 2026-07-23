@@ -75,7 +75,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-APP_VERSION = "YoinkT v43-always-mp4-quality"  # bump on behavior changes; shown in UI footer
+APP_VERSION = "YoinkT v44-always-mp4-meta"  # bump on behavior changes; shown in UI footer
 # NOTE: keep the substring "always-mp4" — run-local.sh greps for it
 
 PROXY_URL = os.environ.get("PROXY_URL") or None
@@ -1353,6 +1353,10 @@ def _social_api_info(url: str, bundle: dict, site: str = "x") -> dict:
         "media": media,
         "subs": [],
         "chapters": 0,
+        # X/TikTok expose view/like counts; IG/FB usually don't. Same uniform
+        # shape as the YouTube path — the single-video source is the richest.
+        "meta": _video_meta(
+            (entries[0] if len(entries) == 1 else vinfo) or {}) if vinfo else _video_meta({}),
     }
 
 
@@ -1566,6 +1570,44 @@ async def api_info(url: str = Query(...)):
         "formats": _curate_formats(info),
         "subs": subs[:30],
         "chapters": len(info.get("chapters") or []),
+        # Rich metadata — all already in the extractor result, previously
+        # discarded. The UI shows views/likes/date/duration on the info card;
+        # description and tags are there for anyone consuming /api/info
+        # directly. Everything is best-effort: fields a site doesn't provide
+        # come back null rather than being omitted, so the shape is stable.
+        "meta": _video_meta(info),
+    }
+
+
+def _video_meta(info: dict) -> dict:
+    """Extra per-video metadata, uniform across sites. Missing fields are
+    null, never absent — a stable shape is easier for the UI than probing."""
+    # upload_date is YYYYMMDD; normalise to ISO so the client needn't parse it
+    raw_date = info.get("upload_date") or info.get("release_date")
+    iso_date = None
+    if raw_date and len(str(raw_date)) == 8 and str(raw_date).isdigit():
+        d = str(raw_date)
+        iso_date = f"{d[:4]}-{d[4:6]}-{d[6:8]}"
+    desc = info.get("description")
+    return {
+        "views": info.get("view_count"),
+        "likes": info.get("like_count"),
+        "comments": info.get("comment_count"),
+        "upload_date": iso_date,          # "2026-01-15" or null
+        "duration": info.get("duration"),  # seconds (mirrors top-level for convenience)
+        "channel": info.get("channel") or info.get("uploader"),
+        "channel_id": info.get("channel_id") or info.get("uploader_id"),
+        "channel_url": info.get("channel_url") or info.get("uploader_url"),
+        "channel_followers": info.get("channel_follower_count"),
+        "is_live": bool(info.get("is_live")),
+        "was_live": bool(info.get("was_live")),
+        "age_limit": info.get("age_limit") or 0,
+        "categories": info.get("categories") or [],
+        "tags": (info.get("tags") or [])[:20],
+        # description can be huge; cap it so /api/info stays small. The UI
+        # shows a preview and can request the rest if ever needed.
+        "description": desc[:5000] if desc else None,
+        "description_truncated": bool(desc and len(desc) > 5000),
     }
 
 

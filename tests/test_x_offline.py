@@ -355,7 +355,7 @@ check("gdl config flag is list", isinstance(app._gdl_config_flag(), list))
 check("gdl config flag empty or known",
       app._gdl_config_flag() in ([], ["--ignore-config"], ["--config-ignore"]))
 
-check("version v43", "v43" in app.APP_VERSION and "always-mp4" in app.APP_VERSION)
+check("version v44", "v44" in app.APP_VERSION and "always-mp4" in app.APP_VERSION)
 
 
 # ---- v39: engine pin must not drift across the four places it appears ----
@@ -773,6 +773,53 @@ check("oversized single download -> 507", "507" in _fd2)
 check("budget-full -> 503 retryable", "503" in _fd2)
 check("reservation released on failure",
       _fd2.count("_scratch_reserved -= est_bytes") >= 2)
+
+
+# ---- v44: rich video metadata ----
+_full = {"view_count": 1234567, "like_count": 89000, "comment_count": 432,
+         "upload_date": "20260115", "duration": 215, "channel": "Foo",
+         "channel_id": "UC1", "channel_follower_count": 50000, "age_limit": 18,
+         "tags": [str(i) for i in range(40)], "categories": ["Music"],
+         "description": "x" * 6000, "is_live": False}
+_m = app._video_meta(_full)
+check("meta surfaces views", _m["views"] == 1234567)
+check("meta surfaces likes", _m["likes"] == 89000)
+check("meta surfaces comments", _m["comments"] == 432)
+check("upload_date normalised to ISO", _m["upload_date"] == "2026-01-15")
+check("meta carries duration", _m["duration"] == 215)
+check("meta carries follower count", _m["channel_followers"] == 50000)
+check("meta carries age limit", _m["age_limit"] == 18)
+check("tags capped at 20", len(_m["tags"]) == 20)
+check("description capped at 5000", len(_m["description"]) == 5000)
+check("truncation flagged", _m["description_truncated"] is True)
+
+# stable shape: missing fields are null, never absent
+_empty = app._video_meta({})
+_keys = {"views","likes","comments","upload_date","duration","channel",
+         "channel_id","channel_url","channel_followers","is_live","was_live",
+         "age_limit","categories","tags","description","description_truncated"}
+check("meta shape stable when everything is missing", set(_empty) == _keys)
+check("missing counts are null not zero", _empty["views"] is None and _empty["likes"] is None)
+check("missing age_limit defaults to 0", _empty["age_limit"] == 0)
+check("bad upload_date -> null", app._video_meta({"upload_date": "garbage"})["upload_date"] is None)
+check("release_date used as date fallback",
+      app._video_meta({"release_date": "20251231"})["upload_date"] == "2025-12-31")
+check("no description -> null, not truncated",
+      _empty["description"] is None and _empty["description_truncated"] is False)
+
+# wired into both info endpoints
+import inspect as _i3
+check("YouTube /api/info returns meta", '"meta": _video_meta(info)' in _i3.getsource(app.api_info))
+check("social /api/info returns meta", "_video_meta(" in _i3.getsource(app._social_api_info))
+
+# UI renders it without crashing on null-heavy payloads
+_ui = pathlib.Path("backend/static/index.html").read_text()
+check("UI has a stat renderer", "function renderStats" in _ui)
+check("UI formats big counts (K/M/B)", "const fcount" in _ui)
+check("UI formats dates", "const fdate" in _ui)
+check("UI shows a description box", 'id="descbox"' in _ui and 'id="desctext"' in _ui)
+check("UI calls renderStats on load", "renderStats(d);" in _ui)
+check("stat row hidden when no chips", "row.style.display = C.length" in _ui)
 
 print(f"\nTOTAL {ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)
