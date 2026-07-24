@@ -265,12 +265,12 @@ check("age clients include mweb", "mweb" in app._YT_AGE_CLIENTS and app._YT_AGE_
 # whenever a working setup exists (cookies OR PO token). v45 only forces the
 # token-free clients in the DEGRADED state (neither), where web is walled anyway
 # so there is no speed to protect.
-_sv_pot38 = app._POT_ON
-app._POT_ON = True  # simulate a working full-speed setup
+_sv_pot38 = app.PO_TOKEN
+app.PO_TOKEN = "web.gvs+TESTTOKEN"; app._pot_script_ready.cache_clear()  # working full-speed setup
 yt_flags = app._common_flags("youtube")
 check("yt cli merge keeps web client when PO token present (v38 speed fix)",
       not any("player_client=" in f for f in yt_flags))
-app._POT_ON = _sv_pot38
+app.PO_TOKEN = _sv_pot38; app._pot_script_ready.cache_clear()
 x_flags = app._common_flags("x")
 check("x cli merge no player_client", not any("player_client=" in f for f in x_flags))
 check("version bumped", app.APP_VERSION.startswith("YoinkT v"))
@@ -362,7 +362,7 @@ check("gdl config flag is list", isinstance(app._gdl_config_flag(), list))
 check("gdl config flag empty or known",
       app._gdl_config_flag() in ([], ["--ignore-config"], ["--config-ignore"]))
 
-check("version v45", "v45" in app.APP_VERSION and "always-mp4" in app.APP_VERSION)
+check("version v46", "v46" in app.APP_VERSION and "always-mp4" in app.APP_VERSION)
 
 
 # ---- v39: engine pin must not drift across the four places it appears ----
@@ -874,13 +874,14 @@ check("extract and download clients agree",
           for c in f.split("player_client=")[1].split(",")])
 
 # a PO token restores the full-speed web client on BOTH paths
-app._POT_ON = True
+_sv_tok = app.PO_TOKEN
+app.PO_TOKEN = "web.gvs+TESTTOKEN"; app._pot_script_ready.cache_clear()
 check("PO token -> no forced clients (web)", app._yt_fallback_clients("youtube") == [])
 check("PO token -> extract uses web",
       "player_client" not in (app._ydl_opts("youtube").get("extractor_args", {}).get("youtube", {})))
 check("PO token -> download uses web",
       not any("player_client" in f for f in app._base_flags("youtube")))
-app._POT_ON = False
+app.PO_TOKEN = _sv_tok; app._pot_script_ready.cache_clear()
 
 # cookies also restore web (the fast path) even without a PO token
 app.SITE_COOKIES = {**app.SITE_COOKIES, "youtube": "/tmp/yt.txt"}
@@ -898,6 +899,57 @@ check("health reports the active yt clients",
 
 app.COOKIES_FILE, app.SITE_COOKIES, app.SITE_COOKIES_RUNTIME, app._POT_ON = (
     _sv_ck, _sv_sc, _sv_rt, _sv_pot)
+
+
+# ---- v46: bgutil script-mode PO tokens (no server, no Docker, no cookies) ----
+_sv = (app.PO_TOKEN, app.POT_PROVIDER_URL, app.POT_SCRIPT_HOME, app.shutil.which,
+       app.COOKIES_FILE, dict(app.SITE_COOKIES), dict(app.SITE_COOKIES_RUNTIME))
+app.PO_TOKEN = None; app.POT_PROVIDER_URL = None
+app.COOKIES_FILE = None; app.SITE_COOKIES = {k: None for k in app.SITE_COOKIES}
+app.SITE_COOKIES_RUNTIME = {}
+
+# off: nothing configured
+app.POT_SCRIPT_HOME = ""; app._pot_script_ready.cache_clear()
+check("pot mode off when nothing set", app._pot_mode() == "off")
+check("off -> fetch_pot=never told to engine",
+      any("fetch_pot=never" in x for x in app._extractor_args_cli()))
+
+# script mode: transpiled dir present + a JS runtime on PATH
+import os as _os
+app.POT_SCRIPT_HOME = "/tmp/potsrv_test"
+_os.makedirs("/tmp/potsrv_test/src", exist_ok=True)
+_os.makedirs("/tmp/potsrv_test/node_modules", exist_ok=True)
+open("/tmp/potsrv_test/src/generate_once.ts", "w").close()
+app.shutil.which = lambda n: "/usr/bin/deno" if n == "deno" else None
+app._pot_script_ready.cache_clear()
+check("script mode detected", app._pot_mode() == "script")
+check("script mode emits bgutilscript arg",
+      any("youtubepot-bgutilscript:server_home=/tmp/potsrv_test" in x
+          for x in app._extractor_args_cli()))
+check("script mode does NOT tell engine fetch_pot=never",
+      not any("fetch_pot=never" in x for x in app._extractor_args_cli()))
+check("script mode sets it in the Python-API dict too",
+      "youtubepot-bgutilscript" in app._extractor_args_dict())
+# a PO token (any mode) turns the 360p token-free fallback OFF -> full-res web
+check("PO token disables the 360p fallback", app._yt_fallback_clients("youtube") == [])
+check("health surfaces pot_mode", "pot_mode" in __import__("inspect").getsource(app.health))
+
+# script dir present but NO runtime -> not ready (must not half-enable)
+app.shutil.which = lambda n: None; app._pot_script_ready.cache_clear()
+check("no JS runtime -> script mode unavailable", app._pot_mode() == "off")
+
+# http mode still wins over script when both present
+app.POT_PROVIDER_URL = "http://127.0.0.1:4416"
+app.shutil.which = lambda n: "/usr/bin/deno" if n == "deno" else None
+app._pot_script_ready.cache_clear()
+check("http provider takes priority over script", app._pot_mode() == "http")
+check("http mode emits bgutilhttp not script",
+      any("bgutilhttp" in x for x in app._extractor_args_cli())
+      and not any("bgutilscript" in x for x in app._extractor_args_cli()))
+
+(app.PO_TOKEN, app.POT_PROVIDER_URL, app.POT_SCRIPT_HOME, app.shutil.which,
+ app.COOKIES_FILE, app.SITE_COOKIES, app.SITE_COOKIES_RUNTIME) = _sv
+app._pot_script_ready.cache_clear()
 
 print(f"\nTOTAL {ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)

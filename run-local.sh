@@ -61,11 +61,46 @@ else
     fi
     curl -sf http://localhost:4416/ping >/dev/null 2>&1 && export POT_PROVIDER_URL="http://localhost:4416"
   fi
+  # No Docker HTTP provider? Fall back to bgutil SCRIPT mode via Deno/Node —
+  # no server, no Docker, no cookies. Set up once at ~/bgutil-ytdlp-pot-provider
+  # (opt in with SETUP_POT=1 the first time; after that it's auto-detected).
+  POT_HOME="${POT_SCRIPT_HOME:-$HOME/bgutil-ytdlp-pot-provider/server}"
+  # ready = the file the plugin actually runs exists (Deno: src/generate_once.ts
+  # + node_modules; Node: build/generate_once.js). NOT just a build/ dir.
+  pot_ready() {
+    { command -v deno >/dev/null 2>&1 && [ -f "$POT_HOME/src/generate_once.ts" ] && [ -d "$POT_HOME/node_modules" ]; } \
+    || { command -v node >/dev/null 2>&1 && [ -f "$POT_HOME/build/generate_once.js" ]; }
+  }
+  if [ -z "${POT_PROVIDER_URL:-}" ] && (command -v deno >/dev/null 2>&1 || command -v node >/dev/null 2>&1); then
+    if ! pot_ready && [ "${SETUP_POT:-0}" = "1" ]; then
+      echo "setting up bgutil PO-token SCRIPT provider (one-time, via Deno)…"
+      REPO="$HOME/bgutil-ytdlp-pot-provider"
+      # pin the clone to the plugin version so the token format stays compatible
+      PLUGIN_VER="$(./.venv/bin/python -c 'import importlib.metadata as m; print(m.version("bgutil-ytdlp-pot-provider"))' 2>/dev/null || echo 1.3.1)"
+      [ -d "$REPO" ] || git clone --single-branch --branch "$PLUGIN_VER" \
+        https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git "$REPO" 2>/dev/null \
+        || git clone --single-branch https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git "$REPO" 2>/dev/null
+      if [ -d "$REPO/server" ]; then
+        ( cd "$REPO/server" && \
+          if command -v deno >/dev/null 2>&1; then deno install --allow-scripts=npm:canvas --frozen >/dev/null 2>&1; \
+          else npm ci >/dev/null 2>&1 && npx tsc >/dev/null 2>&1; fi ) \
+          || echo "note: PO script deps install failed (continuing without it)."
+      fi
+    fi
+    if pot_ready; then
+      export POT_SCRIPT_HOME="$POT_HOME"
+    elif [ "${SETUP_POT:-0}" = "1" ]; then
+      echo "note: PO script provider set up but not detected — check $POT_HOME/src/generate_once.ts and node_modules."
+    fi
+  fi
   if [ -n "${POT_PROVIDER_URL:-}" ]; then
-    echo "PO-token provider: $POT_PROVIDER_URL (full-speed mode)"
+    echo "PO-token provider: $POT_PROVIDER_URL (HTTP mode, full-speed)"
+  elif [ -n "${POT_SCRIPT_HOME:-}" ]; then
+    echo "PO-token provider: script mode via Deno at $POT_SCRIPT_HOME (no Docker, full-speed)"
   else
-    echo "tip: install Docker to auto-run the PO-token provider (full speed), or set POT_PROVIDER_URL yourself."
-    echo "     without it, YouTube may throttle single-connection downloads to ~2-4 MB/s."
+    echo "tip: no PO-token provider. For full resolution WITHOUT cookies or Docker, run once:"
+    echo "     SETUP_POT=1 ./run-local.sh    (sets up the bgutil script provider via Deno)"
+    echo "     without it, no-cookie YouTube is capped at 360p by the token-free clients."
   fi
   command -v deno >/dev/null || echo "note: install Deno for the n-challenge solver: brew install deno"
   command -v python3 >/dev/null || { echo "FAIL: python3 missing"; exit 1; }

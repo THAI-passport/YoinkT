@@ -75,7 +75,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-APP_VERSION = "YoinkT v45-always-mp4-nocookie"  # bump on behavior changes; shown in UI footer
+APP_VERSION = "YoinkT v46-always-mp4-potscript"  # bump on behavior changes; shown in UI footer
 # NOTE: keep the substring "always-mp4" — run-local.sh greps for it
 
 PROXY_URL = os.environ.get("PROXY_URL") or None
@@ -104,10 +104,25 @@ RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "0"))  # 0 = disabled
 # convenience; set 0 on any shared/public deploy.
 ALLOW_COOKIE_UPLOAD = os.environ.get("ALLOW_COOKIE_UPLOAD", "1") not in ("0", "false", "")
 COOKIES_DIR = os.environ.get("COOKIES_DIR") or os.path.join(tempfile.gettempdir(), "YoinkT-cookies")
-# PO token support (present as a legitimate client -> full-speed servers, no
-# "confirm you're not a bot"). Either a static token or a bgutil provider URL.
+# PO token support (present as a legitimate client -> full-speed servers, full
+# resolution ladder, no "confirm you're not a bot"). THREE ways to supply one,
+# in priority order:
+#   1. PO_TOKEN         — a static token string (rarely used; tokens expire).
+#   2. POT_PROVIDER_URL — a running bgutil HTTP server (needs Docker or a node
+#                         server; fastest, best for multi-user/public deploys).
+#   3. bgutil SCRIPT mode — the plugin mints tokens locally via Deno/Node, with
+#                         NO server and NO Docker. This is the cookie-free,
+#                         Docker-free path for a personal instance: you already
+#                         have Deno (it solves the n-challenge), so the same
+#                         runtime can generate PO tokens. Point POT_SCRIPT_HOME
+#                         at the provider's `server/` dir (transpiled once).
+# Script mode spawns a runtime per call, so it's fine for one user but not for
+# high concurrency — use the HTTP server there.
 PO_TOKEN = os.environ.get("PO_TOKEN") or None          # e.g. "web.gvs+XXXX"
 POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL") or None  # bgutil http provider
+# default to the repo's conventional home; used only if it actually exists
+POT_SCRIPT_HOME = (os.environ.get("POT_SCRIPT_HOME")
+                   or os.path.expanduser("~/bgutil-ytdlp-pot-provider/server"))
 MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "6"))
 # kill a stream that produces no data for this long — frees the semaphore slot
 # a hung yt-dlp/ffmpeg would otherwise hold forever (queue starvation).
@@ -533,7 +548,39 @@ def _engine_info() -> dict:
     return info
 
 
-_POT_ON = bool(PO_TOKEN or POT_PROVIDER_URL)
+@functools.lru_cache(maxsize=1)
+def _pot_script_ready() -> bool:
+    """True if bgutil SCRIPT mode is usable. Mirrors the plugin's OWN path logic
+    (getpot_bgutil_script.py) exactly — the two providers look in different
+    places, and guessing wrong is what left this silently off before:
+      - Deno: runs `<home>/src/generate_once.ts` directly; needs node_modules
+        (the plugin passes --allow-ffi=<home>/node_modules).
+      - Node: runs the transpiled `<home>/build/generate_once.js`.
+    Feature-detected + cached; a missing script leaves PO tokens off, never
+    errors a request."""
+    if not POT_SCRIPT_HOME:
+        return False
+    home = POT_SCRIPT_HOME
+    deno_ok = (bool(shutil.which("deno"))
+               and os.path.isfile(os.path.join(home, "src", "generate_once.ts"))
+               and os.path.isdir(os.path.join(home, "node_modules")))
+    node_ok = (bool(shutil.which("node"))
+               and os.path.isfile(os.path.join(home, "build", "generate_once.js")))
+    return deno_ok or node_ok
+
+
+def _pot_mode() -> str:
+    """Which PO-token source is active: 'static' | 'http' | 'script' | 'off'."""
+    if PO_TOKEN:
+        return "static"
+    if POT_PROVIDER_URL:
+        return "http"
+    if _pot_script_ready():
+        return "script"
+    return "off"
+
+
+_POT_ON = bool(PO_TOKEN or POT_PROVIDER_URL or _pot_script_ready())
 
 
 def _extractor_args_dict() -> dict:
@@ -544,7 +591,10 @@ def _extractor_args_dict() -> dict:
         yt["po_token"] = [PO_TOKEN]
     if POT_PROVIDER_URL:
         ea["youtubepot-bgutilhttp"] = {"base_url": [POT_PROVIDER_URL]}
-    if not _POT_ON:
+    elif _pot_script_ready():
+        # local generation via Deno/Node — no server, no Docker
+        ea["youtubepot-bgutilscript"] = {"server_home": [POT_SCRIPT_HOME]}
+    if _pot_mode() == "off":
         # No provider configured: tell yt-dlp NOT to attempt PO tokens at all.
         # Otherwise the installed bgutil plugin probes a provider on every
         # request, fails, and adds seconds of latency for zero benefit.
@@ -561,7 +611,10 @@ def _extractor_args_cli() -> list[str]:
         out += ["--extractor-args", f"youtube:po_token={PO_TOKEN}"]
     if POT_PROVIDER_URL:
         out += ["--extractor-args", f"youtubepot-bgutilhttp:base_url={POT_PROVIDER_URL}"]
-    if not _POT_ON:
+    elif _pot_script_ready():
+        out += ["--extractor-args",
+                f"youtubepot-bgutilscript:server_home={POT_SCRIPT_HOME}"]
+    if _pot_mode() == "off":
         out += ["--extractor-args", "youtube:fetch_pot=never"]
     return out
 
@@ -632,7 +685,7 @@ def _yt_fallback_clients(site: str) -> list[str]:
     for both the Python-API extract path and the CLI download paths, so they
     can never disagree about which client the URLs came from."""
     if (site == "youtube" and _YT_BOT_CLIENTS.strip()
-            and not _cookies_for("youtube") and not _POT_ON):
+            and not _cookies_for("youtube") and _pot_mode() == "off"):
         return [c.strip() for c in _YT_BOT_CLIENTS.split(",") if c.strip()]
     return []
 
@@ -1514,7 +1567,8 @@ async def health():
                              "active": _turbo_active},
             "scratch": _scratch_root(),
             "js_runtime": bool(shutil.which("deno") or shutil.which("node")),
-            "pot": bool(PO_TOKEN or POT_PROVIDER_URL),
+            "pot": _POT_ON,
+            "pot_mode": _pot_mode(),   # static | http | script | off
             "proxy": bool(PROXY_URL), "cookies": bool(COOKIES_FILE),
             # engine build + how old it is. A stale engine is the single most
             # common cause of "it worked yesterday" — surface it here so it's

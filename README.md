@@ -99,7 +99,26 @@ curl -s localhost:8000/api/health | python -m json.tool
 
 When extraction starts failing on a site, that's the signal to bump the pin — not the calendar.
 
+### Full resolution without cookies — PO tokens (no Docker)
+
+YouTube now serves the full resolution ladder only to requests carrying a **PO token**. Without one, the cookie-free `tv`/`ios`/`mweb` player clients still get you *past* the bot wall, but capped at 360p. To get 1080p without cookies, you need a token — and you don't need Docker for it:
+
+```bash
+# one-time: clone + transpile the bgutil provider using Deno (which you already have)
+SETUP_POT=1 ./run-local.sh
+```
+
+This uses the bgutil provider's **script mode** — the plugin mints tokens locally through Deno/Node, no server, no Docker, no cookies. After setup it's auto-detected. Check it's active:
+
+```bash
+curl -s localhost:8000/api/health | python3 -c "import sys,json; d=json.load(sys.stdin); print('pot_mode:', d['pot_mode'], '| yt_clients:', d['yt_clients'])"
+# pot_mode: script | yt_clients: ['web']   <- full-res web client, token-backed
+```
+
+Priority is static token (`PO_TOKEN`) > HTTP server (`POT_PROVIDER_URL`, needs Docker/node) > script mode > off. Script mode spawns a runtime per request, so it's for a personal instance; use the HTTP server for public/multi-user deploys. A PO token *may* not be enough on a genuinely flagged IP (VPN/datacenter) — that still wants cookies or a residential proxy.
+
 **Bot-Blocking Note**: Datacenter IPs are often blocked by YouTube. To fix this, you can configure either:
+- **PO token (script mode)**: `SETUP_POT=1 ./run-local.sh` — cookie-free, Docker-free, full resolution (above).
 - **`PROXY_URL`**: Route traffic through a residential proxy.
 - **`COOKIES_FILE`**: Mount a `cookies.txt` (from a logged-in browser) as a Kubernetes Secret:
   `kubectl create secret generic YoinkT-cookies --from-file=cookies.txt`
