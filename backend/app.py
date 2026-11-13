@@ -39,8 +39,14 @@ Config (env):
                      handshake there can cost the full-speed formats). Needs the
                      optional curl-cffi transport — absence is detected and
                      silently downgrades to the stock client.
-  ENGINE_STALE_DAYS  age past which /api/health flags the extraction engine as
-                     stale (default 21). Reporting only; nothing is blocked.
+   ENGINE_STALE_DAYS  age past which /api/health flags the extraction engine as
+                      stale (default 21). Reporting only; nothing is blocked.
+   ENGINE_AUTO_UPDATE daily PyPI check + pip upgrade of yt-dlp into the venv
+                      (default on; 0 disables). Takes effect after restart.
+   ENGINE_UPDATE_CHECK_HOURS  hours between auto-update checks (default 24).
+   FFMPEG_RECHECK_SECS how often the validated-ffmpeg resolver re-checks the
+                      binary (default 300). Guards against a broken/stub ffmpeg
+                      shadowing the real one on PATH.
   ALLOW_PRIVATE_EGRESS
                      "1" lets resolved media URLs point at private/loopback
                      addresses. OFF by default — the site allowlist guards the
@@ -66,6 +72,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import suppress
 
@@ -75,7 +82,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-APP_VERSION = "YoinkT v46-always-mp4-potscript"  # bump on behavior changes; shown in UI footer
+APP_VERSION = "YoinkT v52-always-mp4-no-reextract"  # bump on behavior changes; shown in UI footer
 # NOTE: keep the substring "always-mp4" — run-local.sh greps for it
 
 PROXY_URL = os.environ.get("PROXY_URL") or None
@@ -124,6 +131,54 @@ POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL") or None  # bgutil http pro
 POT_SCRIPT_HOME = (os.environ.get("POT_SCRIPT_HOME")
                    or os.path.expanduser("~/bgutil-ytdlp-pot-provider/server"))
 MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "6"))
+# Local-instance guard borrowed from cobalt's DURATION_LIMIT: refuse absurdly
+# long videos before staging them. 0 = disabled (default: a personal instance
+# shouldn't refuse anything by surprise; set e.g. 14400 for a public box).
+MAX_DURATION_SECS = int(os.environ.get("MAX_DURATION_SECS", "0"))
+# Bound concurrent upstream socket opens from the sync proxy paths. The
+# streaming semaphore gates the body relay inside the response generator, but
+# the initial opener.open() happens before the response exists — without this
+# gate a batch can open unbounded sockets against a slow CDN first.
+_FETCH_GATE = threading.Semaphore(max(8, MAX_CONCURRENCY * 4))
+
+
+def _canonical_url(url: str) -> str:
+    """Cache key for info/bundle caches: same video, one entry.
+
+    Strips tracking/noise query params (?si=, ?utm_*, ?fbclid), lowercases the
+    host, drops default ports and trailing slashes. Keeps the params that
+    actually identify the media (v=, video id path, t= is kept — same video).
+    Falls back to the raw URL on parse failure.
+    """
+    try:
+        from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+        parts = urlsplit(url.strip())
+        host = (parts.hostname or "").lower()
+        if not host:
+            return url
+        # drop tracking params that create duplicate cache entries
+        drop = {"si", "utm_source", "utm_medium", "utm_campaign", "utm_term",
+                "utm_content", "fbclid", "gclid", "igshid", "igsh"}
+        kept = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+                if k not in drop]
+        # normalize youtu.be / www.youtube.com -> youtube.com (same video)
+        if host in ("youtu.be", "www.youtu.be", "m.youtube.com", "www.youtube.com",
+                    "music.youtube.com", "youtubekids.com", "www.youtubekids.com"):
+            host = "youtube.com"
+        elif host.startswith("www.") and host.count(".") >= 2:
+            # www.x.com == x.com for our sites; mobile/vm shortlinks kept
+            bare = host[4:]
+            if bare in ("x.com", "twitter.com", "facebook.com", "instagram.com",
+                        "tiktok.com", "fb.watch"):
+                host = bare
+        netloc = host
+        if parts.port and parts.port not in (80, 443):
+            netloc += f":{parts.port}"
+        path = parts.path.rstrip("/") or "/"
+        return urlunsplit((parts.scheme.lower(), netloc, path,
+                           urlencode(kept, doseq=True), ""))
+    except Exception:
+        return url
 # kill a stream that produces no data for this long — frees the semaphore slot
 # a hung yt-dlp/ffmpeg would otherwise hold forever (queue starvation).
 STREAM_STALL_TIMEOUT = int(os.environ.get("STREAM_STALL_TIMEOUT", "120"))
@@ -548,6 +603,81 @@ def _engine_info() -> dict:
     return info
 
 
+# ---- engine auto-update ------------------------------------------------------
+# The extraction engine rots: platforms change, a build from three weeks ago
+# starts 502ing. run-local.sh already upgrades on every restart (when
+# ENGINE_VERSION=latest), but a server left running for weeks never saw that.
+# This loop checks PyPI once a day and pip-installs the newer build into the
+# running venv. The NEW code takes effect on the next worker start — yt-dlp is
+# imported at module scope in the request paths, so a RESTART is needed to use
+# it; health + logs make that visible instead of silent.
+ENGINE_AUTO_UPDATE = os.environ.get("ENGINE_AUTO_UPDATE", "1") not in ("0", "false", "no")
+ENGINE_UPDATE_CHECK_HOURS = float(os.environ.get("ENGINE_UPDATE_CHECK_HOURS", "24"))
+_engine_update: dict = {"last_check": None, "last_result": None,
+                        "installed_version": None}
+
+
+def _installed_engine_version() -> str | None:
+    try:
+        from yt_dlp.version import __version__ as ver
+        return ver
+    except Exception:
+        return None
+
+
+def _engine_update_once() -> dict:
+    """One pip upgrade pass. Returns a small status dict (also kept for health)."""
+    before = _installed_engine_version()
+    try:
+        r = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--pre", "--upgrade",
+             "--quiet", "yt-dlp"],
+            capture_output=True, timeout=600)
+        ok = r.returncode == 0
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}",
+                "before": before}
+    after = _installed_engine_version() if ok else before
+    result = {"ok": ok, "before": before, "after": after,
+              "updated": bool(ok and after and after != before),
+              "stderr": r.stderr.decode(errors="replace").strip()[-300:] if not ok else ""}
+    if result["updated"]:
+        log.info("extraction engine updated %s -> %s — restart to pick it up "
+                 "(health will keep showing the running build until then)",
+                 before, after)
+    elif not ok:
+        log.warning("engine auto-update failed: %s", result["stderr"])
+    return result
+
+
+async def _engine_update_loop():
+    if not ENGINE_AUTO_UPDATE:
+        return
+    # stagger startup: don't hit PyPI while the server is still warming up
+    await asyncio.sleep(60)
+    while True:
+        try:
+            res = await asyncio.to_thread(_engine_update_once)
+            res["checked_at"] = datetime.datetime.now(
+                datetime.timezone.utc).isoformat(timespec="seconds")
+            _engine_update.update(last_check=res["checked_at"],
+                                  last_result=res,
+                                  installed_version=_installed_engine_version())
+        except Exception as e:  # never let the loop die
+            log.warning("engine auto-update crashed: %s", e)
+        await asyncio.sleep(ENGINE_UPDATE_CHECK_HOURS * 3600)
+
+
+# Registered defensively: the offline test suite stubs FastAPI without
+# on_event; a missing hook there must not break imports.
+if hasattr(app, "on_event"):
+    @app.on_event("startup")
+    async def _start_background_tasks():
+        _engine_update.setdefault("installed_version",
+                                  _installed_engine_version())
+        asyncio.create_task(_engine_update_loop())
+
+
 @functools.lru_cache(maxsize=1)
 def _pot_script_ready() -> bool:
     """True if bgutil SCRIPT mode is usable. Mirrors the plugin's OWN path logic
@@ -583,21 +713,34 @@ def _pot_mode() -> str:
 _POT_ON = bool(PO_TOKEN or POT_PROVIDER_URL or _pot_script_ready())
 
 
+def _pot_wanted() -> bool:
+    """Whether to actually attach a PO token. YouTube-only, and NOT when cookies
+    already authenticate — cookies make PO redundant (proven: plain cookied
+    yt-dlp downloads 1080p with no PO token). This is not just an optimisation:
+    the merge spawns two yt-dlp workers, and script-mode PO generation there
+    HANGS the whole download (bgutil's own docs warn script mode handles
+    concurrency poorly). With cookies present, attaching PO bought nothing and
+    froze every merge. So: cookies win, PO is skipped."""
+    return _pot_mode() != "off" and not _cookies_for("youtube")
+
+
 def _extractor_args_dict() -> dict:
     """PO-token extractor args for the yt-dlp Python API (dict of dict of lists)."""
     ea: dict = {}
     yt: dict = {}
-    if PO_TOKEN:
-        yt["po_token"] = [PO_TOKEN]
-    if POT_PROVIDER_URL:
-        ea["youtubepot-bgutilhttp"] = {"base_url": [POT_PROVIDER_URL]}
-    elif _pot_script_ready():
-        # local generation via Deno/Node — no server, no Docker
-        ea["youtubepot-bgutilscript"] = {"server_home": [POT_SCRIPT_HOME]}
-    if _pot_mode() == "off":
-        # No provider configured: tell yt-dlp NOT to attempt PO tokens at all.
-        # Otherwise the installed bgutil plugin probes a provider on every
-        # request, fails, and adds seconds of latency for zero benefit.
+    if _pot_wanted():
+        if PO_TOKEN:
+            yt["po_token"] = [PO_TOKEN]
+        if POT_PROVIDER_URL:
+            ea["youtubepot-bgutilhttp"] = {"base_url": [POT_PROVIDER_URL]}
+        elif _pot_script_ready():
+            # local generation via Deno/Node — no server, no Docker
+            ea["youtubepot-bgutilscript"] = {"server_home": [POT_SCRIPT_HOME]}
+    else:
+        # Nothing to fetch (no provider, or cookies already authenticate): tell
+        # yt-dlp NOT to attempt PO tokens. Otherwise the installed bgutil plugin
+        # probes/generates on every request — wasted latency at best, a merge
+        # deadlock at worst.
         yt["fetch_pot"] = ["never"]
     if yt:
         ea["youtube"] = yt
@@ -607,6 +750,8 @@ def _extractor_args_dict() -> dict:
 def _extractor_args_cli() -> list[str]:
     """Same, as yt-dlp CLI --extractor-args flags for the subprocess paths."""
     out: list[str] = []
+    if not _pot_wanted():
+        return ["--extractor-args", "youtube:fetch_pot=never"]
     if PO_TOKEN:
         out += ["--extractor-args", f"youtube:po_token={PO_TOKEN}"]
     if POT_PROVIDER_URL:
@@ -614,12 +759,10 @@ def _extractor_args_cli() -> list[str]:
     elif _pot_script_ready():
         out += ["--extractor-args",
                 f"youtubepot-bgutilscript:server_home={POT_SCRIPT_HOME}"]
-    if _pot_mode() == "off":
-        out += ["--extractor-args", "youtube:fetch_pot=never"]
     return out
 
 
-def _ydl_opts(site: str = "youtube") -> dict:
+def _ydl_opts(site: str = "youtube", url: str | None = None) -> dict:
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -634,7 +777,11 @@ def _ydl_opts(site: str = "youtube") -> dict:
     if ck:
         opts["cookiefile"] = ck
     ea = _extractor_args_dict()  # namespaced per-extractor; harmless off-youtube
-    clients = _yt_fallback_clients(site)
+    # Fresh URLs (url=None) always start on `web`; the fallback applies only to
+    # URLs that already proved bot-walled (see _extract retry). url=None here
+    # means "no history", not "eligibility" — health reports eligibility via
+    # _yt_fallback_clients(site) directly.
+    clients = _yt_fallback_clients(site, url) if url else []
     if clients:
         ea = {**ea, "youtube": {**(ea.get("youtube") or {}),
                                 "player_client": clients}}
@@ -659,35 +806,54 @@ def _ydl_opts(site: str = "youtube") -> dict:
 _YT_AGE_CLIENTS = os.environ.get("YT_AGE_CLIENTS", "default,tv,mweb,web_safari")
 
 # Cookie-free, PO-token-free YouTube. The default `web` client now demands a PO
-# token and throws "Sign in to confirm you're not a bot" without one. The `tv`
-# and `ios` player clients use a different auth path that frequently still works
-# token-free. So when the instance has NEITHER cookies NOR a PO token — the
-# degraded state where `web` is unreliable — YoinkT uses these clients for
-# BOTH extraction AND download. It must be both: if extraction used `tv` but the
-# merge download used `web`, the download would hit the wall the extract dodged.
+# token and throws "Sign in to confirm you're not a bot" without one — but ONLY
+# from flagged networks (datacenter IPs). From a residential IP `web` works
+# fine token-free AND serves more formats than the alternates. The `tv`/`ios`
+# clients use a different auth path that frequently still works token-free
+# where `web` is walled — but they serve FEWER formats and break some videos
+# entirely (a Short 404'd under `tv,ios,mweb` while `web` returned 47 formats).
 #
-# Applied proactively rather than as a retry, precisely so the two stay in sync.
-# When cookies or a PO token ARE present, this is skipped and the full-speed
-# `web` client is used as before.
+# So the fallback is a RETRY, not a default: every URL is tried with `web`
+# first, and only a bot-wall error re-runs it with the fallback clients. The
+# URLs that needed it are remembered (canonical key) so the DOWNLOAD workers —
+# which spawn after extraction — request the SAME clients the extract used.
+# If extraction used `web` but the merge used `tv`, the download would hit the
+# exact wall extraction dodged (or 404 formats `tv` never saw).
 #
 # HONEST: a moving target. YouTube closes these paths periodically; which
-# clients work shifts month to month, so it's an env list you can retune. `tv`
-# is currently the most reliable token-free client, `ios` the backup. These
-# clients can be slower or offer fewer formats than `web` — a slower download
-# beats a bot wall. Set YT_BOT_CLIENTS="" to force pure `web` (the old behavior)
-# if you have a residential IP where `web` works token-free.
+# clients work shifts month to month, so it's an env list you can retune. Set
+# YT_BOT_CLIENTS="" to disable the retry entirely (pure `web`, the old
+# behavior) if you have a residential IP where `web` never walls.
 _YT_BOT_CLIENTS = os.environ.get("YT_BOT_CLIENTS", "tv,ios,mweb")
 
+# Canonical URLs that proved bot-walled with `web` and extracted OK with the
+# fallback clients. Consulted by the download paths so they match the extract.
+# Bounded: only the last 2048 are kept; a bad entry merely costs one retry.
+_YT_FALLBACK_NEEDED: set[str] = set()
 
-def _yt_fallback_clients(site: str) -> list[str]:
-    """Token-free player clients to use for YouTube when we have no cookies and
-    no PO token — [] otherwise (full-speed web client). Single source of truth
-    for both the Python-API extract path and the CLI download paths, so they
-    can never disagree about which client the URLs came from."""
+
+def _yt_fallback_clients(site: str, url: str | None = None) -> list[str]:
+    """Token-free player clients for YouTube when we have no cookies and no PO
+    token — [] otherwise (full-speed web client). With a URL, the list applies
+    ONLY if that URL previously needed the fallback (web-first retry); without
+    a URL it reports the configured list (eligibility, e.g. for /api/health).
+    Single source of truth for the Python-API extract path and the CLI download
+    paths, so they can never disagree about which client the URLs came from."""
     if (site == "youtube" and _YT_BOT_CLIENTS.strip()
             and not _cookies_for("youtube") and _pot_mode() == "off"):
-        return [c.strip() for c in _YT_BOT_CLIENTS.split(",") if c.strip()]
+        if url is None or _canonical_url(url) in _YT_FALLBACK_NEEDED:
+            return [c.strip() for c in _YT_BOT_CLIENTS.split(",") if c.strip()]
     return []
+
+
+def _is_bot_error(e: Exception) -> bool:
+    """YouTube's "you look like a bot" wall — the one case the fallback
+    clients can fix. Distinct from the age gate (needs cookies, retry won't
+    help) and from private/removed videos (retry just burns a request)."""
+    m = str(e).lower()
+    return ("confirm you're not a bot" in m or "confirm you’re not a bot" in m
+            or "sign in to confirm you're not a bot" in m
+            or "sign in to confirm you’re not a bot" in m)
 
 
 def _is_age_error(e: Exception) -> bool:
@@ -808,6 +974,28 @@ def _extract(url: str) -> dict:
             opts2 = {**opts, "extractor_args": {**ea, "youtube": yt}}
             with yt_dlp.YoutubeDL(opts2) as ydl:
                 return ydl.extract_info(url, download=False)
+        # Bot wall on a token-free instance: `web` works from most residential
+        # IPs, but datacenter IPs get challenged. Retry ONCE with the fallback
+        # clients — and remember the URL so the download workers (which spawn
+        # after extraction) request the same clients the extract used. Web-first
+        # because the fallbacks serve fewer formats and break some videos
+        # outright (a Short 404'd under tv/ios/mweb while web returned 47).
+        if (site == "youtube" and _is_bot_error(e)
+                and _yt_fallback_clients(site)):
+            fb = _yt_fallback_clients(site)
+            log.info("bot wall on %s; retrying player_client=%s",
+                     url[:80], ",".join(fb))
+            ea = dict(opts.get("extractor_args") or {})
+            yt = dict(ea.get("youtube") or {})
+            yt["player_client"] = fb
+            opts2 = {**opts, "extractor_args": {**ea, "youtube": yt}}
+            with yt_dlp.YoutubeDL(opts2) as ydl:
+                info = ydl.extract_info(url, download=False)
+            key = _canonical_url(url)
+            _YT_FALLBACK_NEEDED.add(key)
+            if len(_YT_FALLBACK_NEEDED) > 2048:
+                _YT_FALLBACK_NEEDED.clear()
+            return info
         # Client-level block on a site we did NOT pre-arm with a stealth
         # profile: retry once with one. Cheap (a second handshake), bounded
         # (only on the narrow phrase list above), and it turns the most common
@@ -840,18 +1028,19 @@ _info_lock_users: dict[str, int] = {}
 
 
 async def _extract_cached(url: str) -> dict:
-    hit = _INFO_CACHE.get(url)
+    key = _canonical_url(url)
+    hit = _INFO_CACHE.get(key)
     if hit and time.time() - hit[0] < _INFO_TTL:
         return hit[1]
-    lock = _info_locks.setdefault(url, asyncio.Lock())
-    _info_lock_users[url] = _info_lock_users.get(url, 0) + 1
+    lock = _info_locks.setdefault(key, asyncio.Lock())
+    _info_lock_users[key] = _info_lock_users.get(key, 0) + 1
     try:
         async with lock:
-            hit = _INFO_CACHE.get(url)
+            hit = _INFO_CACHE.get(key)
             if hit and time.time() - hit[0] < _INFO_TTL:
                 return hit[1]
             info = await asyncio.to_thread(_extract, url)
-            _INFO_CACHE[url] = (time.time(), info)
+            _INFO_CACHE[key] = (time.time(), info)
             if len(_INFO_CACHE) > 256:  # simple LRU-ish cap
                 oldest = min(_INFO_CACHE, key=lambda k: _INFO_CACHE[k][0])
                 _INFO_CACHE.pop(oldest, None)
@@ -871,13 +1060,13 @@ async def _extract_cached(url: str) -> dict:
         # same URL and extracts concurrently with the waiter — precisely the
         # duplicate-collapse this lock exists to prevent. The refcount counts
         # holders AND waiters, so only the genuine last one out reclaims.
-        n = _info_lock_users.get(url, 1) - 1
+        n = _info_lock_users.get(key, 1) - 1
         if n > 0:
-            _info_lock_users[url] = n
+            _info_lock_users[key] = n
         else:
-            _info_lock_users.pop(url, None)
-            if url not in _INFO_CACHE:
-                _info_locks.pop(url, None)
+            _info_lock_users.pop(key, None)
+            if key not in _INFO_CACHE:
+                _info_locks.pop(key, None)
 
 
 def _safe_name(title: str) -> str:
@@ -1304,17 +1493,23 @@ def _best_prog_mp4(entry: dict) -> dict | None:
 # TTL/lock pattern as _extract_cached (photo CDN URLs are long-lived).
 _X_CACHE: dict[str, tuple[float, dict]] = {}
 _x_locks: dict[str, asyncio.Lock] = {}
+# Same refcount discipline as _info_lock_users: holders AND waiters counted,
+# so only the last one out reclaims the lock (see _extract_cached WHY).
+_x_lock_users: dict[str, int] = {}
 
 
 async def _bundle_cached(url: str, site: str) -> dict:
-    hit = _X_CACHE.get(url)
+    key = _canonical_url(url)
+    hit = _X_CACHE.get(key)
     if hit and time.time() - hit[0] < _INFO_TTL:
         return hit[1]
-    lock = _x_locks.setdefault(url, asyncio.Lock())
-    async with lock:
-        hit = _X_CACHE.get(url)
-        if hit and time.time() - hit[0] < _INFO_TTL:
-            return hit[1]
+    lock = _x_locks.setdefault(key, asyncio.Lock())
+    _x_lock_users[key] = _x_lock_users.get(key, 0) + 1
+    try:
+        async with lock:
+            hit = _X_CACHE.get(key)
+            if hit and time.time() - hit[0] < _INFO_TTL:
+                return hit[1]
 
         async def _video():
             try:
@@ -1359,12 +1554,24 @@ async def _bundle_cached(url: str, site: str) -> dict:
             raise HTTPException(
                 502, f"extract failed: no video or photos found in this post{hint}")
         bundle = {"vinfo": vinfo, "photos": photos, "og_videos": og_videos}
-        _X_CACHE[url] = (time.time(), bundle)
+        _X_CACHE[key] = (time.time(), bundle)
         if len(_X_CACHE) > 256:
             oldest = min(_X_CACHE, key=lambda k: _X_CACHE[k][0])
             _X_CACHE.pop(oldest, None)
-            _x_locks.pop(oldest, None)
+            if not _x_lock_users.get(oldest):
+                _x_locks.pop(oldest, None)
         return bundle
+    finally:
+        # Mirror _extract_cached: reclaim by refcount, not by cache eviction,
+        # so a failing social URL (which writes no cache entry) can't leak its
+        # lock forever. Only the last holder-or-waiter out pops the lock.
+        n = _x_lock_users.get(key, 1) - 1
+        if n > 0:
+            _x_lock_users[key] = n
+        else:
+            _x_lock_users.pop(key, None)
+            if key not in _X_CACHE:
+                _x_locks.pop(key, None)
 
 
 def _social_name(site: str, vinfo: dict) -> str:
@@ -1558,7 +1765,7 @@ async def health():
     eng = _engine_info()
     return {"ok": True, "version": APP_VERSION,
             "max_concurrency": MAX_CONCURRENCY,
-            "turbo": bool(shutil.which("aria2c")),
+            "turbo": bool(_resolve_bin("aria2c")),
             # Surfaced so a slow bulk run can be diagnosed without guessing:
             # connections are a shared budget, not per-lane.
             "turbo_budget": {"total_connections": TURBO_CONN_BUDGET,
@@ -1574,9 +1781,36 @@ async def health():
             # common cause of "it worked yesterday" — surface it here so it's
             # one curl away instead of a guess.
             "engine": eng,
-            # which YouTube player clients are in use: [] = full-speed web
-            # (cookies or PO token present); a list = token-free fallback.
-            "yt_clients": _yt_fallback_clients("youtube") or ["web"],
+            # validated external binaries (the dummy-stub shadowing incident
+            # made these one-glance diagnosable instead of silent 0-byte 200s)
+            "ffmpeg": {"ok": bool(_resolve_bin("ffmpeg")), "path": _resolve_bin("ffmpeg")},
+            "binaries": {n: {"ok": bool(_resolve_bin(n)), "path": _resolve_bin(n)}
+                         for n in ("yt-dlp", "aria2c")},
+            # daily engine auto-update status (restart applies an installed update)
+            "engine_auto_update": {"enabled": ENGINE_AUTO_UPDATE,
+                                   **_engine_update,
+                                   # The update installs into the venv but the
+                                   # RUNNING process keeps the old build until
+                                   # restart — surface that explicitly so the UI
+                                   # footer can say "restart to apply X".
+                                   "running_version": eng.get("version"),
+                                   "restart_needed": bool(
+                                       _engine_update.get("installed_version")
+                                       and _engine_update.get("installed_version")
+                                       != eng.get("version"))},
+            # local-instance caps worth seeing at a glance (cobalt parity:
+            # DURATION_LIMIT, byte budgets). 0 = disabled.
+            "limits": {"max_duration_secs": MAX_DURATION_SECS,
+                       "zip_max_bytes": int(os.environ.get(
+                           "ZIP_MAX_BYTES", str(64 * 1024 * 1024))),
+                       "zip_single_max_bytes": int(os.environ.get(
+                           "ZIP_SINGLE_MAX_BYTES", str(32 * 1024 * 1024)))},
+            # Web-first: fresh URLs always try the full-speed `web` client. The
+            # token-free list below is the RETRY for URLs that prove bot-walled
+            # (tracked per-URL); `fallback_urls` counts how many have needed it.
+            "yt_clients": ["web"],
+            "yt_fallback_clients": _yt_fallback_clients("youtube"),
+            "yt_fallback_urls": len(_YT_FALLBACK_NEEDED),
             "stealth": {"available": _stealth_available(),
                         "profiles": {s: _stealth_for(s)
                                      for s in sorted(ENABLED_SITES & SITE_RES.keys())}},
@@ -1703,6 +1937,27 @@ def _video_meta(info: dict) -> dict:
     }
 
 
+def _check_duration(info: dict) -> None:
+    """Refuse absurdly long videos when MAX_DURATION_SECS is set (>0).
+
+    Disabled by default: a personal instance shouldn't refuse anything by
+    surprise. A public box sets e.g. MAX_DURATION_SECS=14400 to stop one
+    12-hour VOD from pinning a download slot all day.
+    """
+    if MAX_DURATION_SECS > 0:
+        dur = info.get("duration") or 0
+        try:
+            if float(dur) > MAX_DURATION_SECS:
+                raise HTTPException(
+                    413, f"video is {int(float(dur) // 60)} min; this instance "
+                         f"caps downloads at {MAX_DURATION_SECS // 60} min "
+                         f"(MAX_DURATION_SECS)")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+
 @app.get("/api/playlist")
 async def api_playlist(url: str = Query(...)):
     _require_youtube(url)
@@ -1711,8 +1966,26 @@ async def api_playlist(url: str = Query(...)):
         import yt_dlp
 
         opts = _ydl_opts() | {"extract_flat": "in_playlist", "noplaylist": False}
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=False)
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, download=False)
+        except Exception as e:
+            if not (_is_bot_error(e) and _yt_fallback_clients("youtube")):
+                raise
+            fb = _yt_fallback_clients("youtube")
+            log.info("bot wall on playlist; retrying player_client=%s",
+                     ",".join(fb))
+            ea = dict(opts.get("extractor_args") or {})
+            yt = dict(ea.get("youtube") or {})
+            yt["player_client"] = fb
+            with yt_dlp.YoutubeDL(
+                    {**opts, "extractor_args": {**ea, "youtube": yt}}) as ydl:
+                info = ydl.extract_info(url, download=False)
+            key = _canonical_url(url)
+            _YT_FALLBACK_NEEDED.add(key)
+            if len(_YT_FALLBACK_NEEDED) > 2048:
+                _YT_FALLBACK_NEEDED.clear()
+            return info
 
     async with sem:
         try:
@@ -1765,7 +2038,10 @@ async def api_subs(url: str = Query(...), lang: str = Query(...)):
         raise HTTPException(404, "no subtitles for that language")
     track = next((t for t in tracks if t.get("ext") == "vtt"), tracks[0])
     try:
-        raw = await asyncio.to_thread(_fetch_url, track["url"])
+        # Gate subtitle fetches like everything else: unbounded bursts of
+        # subtitle requests could otherwise bypass MAX_CONCURRENCY entirely.
+        async with sem:
+            raw = await asyncio.to_thread(_fetch_url, track["url"])
     except Exception as e:
         raise _classify_error(e, _site_of(url) or "youtube") from e
     srt = _vtt_to_srt(raw.decode("utf-8", "replace"))
@@ -1825,7 +2101,103 @@ async def _stream_proc(cmd: list[str], media_type: str, filename: str):
     return StreamingResponse(gen(), media_type=media_type, headers=headers)
 
 
-def _base_flags(site: str = "youtube") -> list[str]:
+# ---- binary guard -------------------------------------------------------------
+# shutil.which("x") only proves SOMETHING named x is first on PATH — not that
+# it works. This machine once had a stub script at ~/.local/bin/ffmpeg
+# shadowing the real Homebrew build, so every merge spawned the stub and came
+# back as a 200 with ZERO bytes ("it used to work…"). The same shadowing can
+# silently break yt-dlp (merge workers) and aria2c (turbo), so ALL external
+# binaries go through one resolver:
+#   1. VALIDATES the candidate (`--version` must answer like the real tool),
+#   2. for yt-dlp prefers the interpreter's OWN venv bin dir (the exact build
+#      auto-update maintains) before PATH,
+#   3. falls back to well-known install locations when PATH lies,
+#   4. re-checks on a TTL, so fixing/installing a binary self-heals a running
+#      server without a restart.
+_BIN_FALLBACKS: dict[str, list[str]] = {
+    "ffmpeg": [
+        "/opt/homebrew/bin/ffmpeg",   # Homebrew on Apple silicon
+        "/usr/local/bin/ffmpeg",      # Homebrew on Intel macs / /usr/local
+        "/usr/bin/ffmpeg",            # distro-packaged (Linux)
+        "/snap/bin/ffmpeg",           # snap (Linux)
+    ],
+    "aria2c": [
+        "/opt/homebrew/bin/aria2c",
+        "/usr/local/bin/aria2c",
+        "/usr/bin/aria2c",
+    ],
+}
+# yt-dlp's fallback is dynamic: the bin dir of the RUNNING interpreter — i.e.
+# this venv, the one ENGINE_AUTO_UPDATE upgrades — beats anything on PATH.
+_BIN_RECHECK_SECS = int(os.environ.get("FFMPEG_RECHECK_SECS", "300"))
+_bin_cache: dict[str, tuple[str | None, float]] = {}
+
+
+def _bin_works(name: str, path: str) -> bool:
+    """The candidate answers a version probe like the REAL tool, not a stub."""
+    # ffmpeg only knows -version (--version exits rc=8 with an empty stdout)
+    flag = "-version" if name == "ffmpeg" else "--version"
+    try:
+        r = subprocess.run([path, flag], capture_output=True, timeout=10)
+        out = r.stdout.strip()
+    except Exception:
+        return False
+    if r.returncode != 0 or not out:
+        return False
+    if name == "ffmpeg":
+        return out.startswith(b"ffmpeg version")
+    if name == "aria2c":
+        return out.startswith(b"aria2 version")
+    if name == "yt-dlp":
+        # date-versioned: 2026.08.20(.nnnnnn); rejects `echo dummy` stubs
+        return bool(re.match(rb"\d{4}\.\d{2}\.\d+", out.split()[0]))
+    return True
+
+
+def _bin_candidates(name: str) -> list[str]:
+    cands = []
+    if name == "yt-dlp":
+        cands.append(os.path.join(os.path.dirname(sys.executable), name))
+    cands.append(shutil.which(name))
+    cands += _BIN_FALLBACKS.get(name, [])
+    return [c for c in dict.fromkeys(cands) if c]
+
+
+def _resolve_bin(name: str) -> str | None:
+    """A VALIDATED path for an external binary, or None if none works."""
+    now = time.monotonic()
+    cached = _bin_cache.get(name)
+    if cached and cached[0] and now - cached[1] < _BIN_RECHECK_SECS:
+        return cached[0]
+    candidates = _bin_candidates(name)
+    found = next((c for c in candidates if os.path.isfile(c)
+                  and _bin_works(name, c)), None)
+    prev = cached[0] if cached else None
+    if found != prev:
+        if found:
+            log.info("%s resolved: %s%s", name, found,
+                     "" if not prev else f" (was {prev})")
+        else:
+            log.error("NO WORKING %s FOUND on PATH or fallback locations (%s) "
+                      "— downloads will fail. Install it and restart.",
+                      name.upper(), ", ".join(candidates))
+    _bin_cache[name] = (found, now)
+    return found
+
+
+def _ytdlp_cmd() -> list[str]:
+    """The engine CLI as an argv prefix. Falls back to the bare name only when
+    NO validated binary exists anywhere (so behavior degrades to pre-guard
+    instead of spawning a corrupted argv); health + logs flag that state."""
+    p = _resolve_bin("yt-dlp")
+    return [p or "yt-dlp"]
+
+
+def _ffmpeg_bin() -> str | None:
+    return _resolve_bin("ffmpeg")
+
+
+def _base_flags(site: str = "youtube", url: str | None = None) -> list[str]:
     # Config isolation comes FIRST and is not optional. The engine binary
     # otherwise merges settings from several system/user config paths, so a
     # stray file on the host — or in a future base image — silently rewrites
@@ -1843,18 +2215,20 @@ def _base_flags(site: str = "youtube") -> list[str]:
     if prof:
         flags += ["--impersonate", prof]
     flags += _extractor_args_cli()
-    # Same token-free player clients the extract path chose, so the download
-    # workers request the SAME formats. Without this the merge download would
-    # use the default `web` client and hit the exact bot wall extraction dodged.
-    clients = _yt_fallback_clients(site)
+    # Same player clients the extract path used for THIS url (web-first; the
+    # fallback list only for URLs that proved bot-walled). Without this a merge
+    # download would use `web` for a walled URL and hit the exact wall the
+    # extract dodged — or `tv` for a URL whose formats only `web` can see.
+    # url=None means fresh (web); history is per-URL, never global.
+    clients = _yt_fallback_clients(site, url) if url else []
     if clients:
         flags += ["--extractor-args", f"youtube:player_client={','.join(clients)}"]
     return flags
 
 
-def _common_flags(site: str = "youtube") -> list[str]:
+def _common_flags(site: str = "youtube", url: str | None = None) -> list[str]:
     # streaming paths: yt-dlp's own parallel fragments + range chunking
-    flags = _base_flags(site) + ["--concurrent-fragments", str(CONCURRENT_FRAGMENTS)]
+    flags = _base_flags(site, url) + ["--concurrent-fragments", str(CONCURRENT_FRAGMENTS)]
     if HTTP_CHUNK_SIZE not in ("0", "", "off"):
         flags += ["--http-chunk-size", HTTP_CHUNK_SIZE]
     # NB (v38): do NOT force youtube player_client here. v34 injected
@@ -1867,10 +2241,34 @@ def _common_flags(site: str = "youtube") -> list[str]:
     return flags
 
 
+def _dump_info_json(info: dict | None, tmpdir: str) -> list[str]:
+    """Worker argv fragment that skips re-extraction.
+
+    The download workers used to receive only the video URL, so each one
+    re-ran full extraction (page fetch + PO-token mint + n-challenge) before
+    downloading its first byte — ~22s of dead startup on the merge path, paid
+    twice (once per worker). But the request handler already holds a
+    minutes-old info dict (stream URLs live ~6h), so hand it to the workers:
+    --load-info-json goes straight to fragment download. No info (or a dump
+    failure) falls back to URL extraction — slower, never broken.
+    """
+    if not info:
+        return []
+    import json
+    try:
+        path = os.path.join(tmpdir, "info.json")
+        with open(path, "w") as f:
+            json.dump(info, f, default=str)
+        return ["--load-info-json", path]
+    except Exception as e:
+        log.warning("info dump failed (%s); workers will re-extract", e)
+        return []
+
+
 def _stream_merge(
     url: str, v_id: str, a_id: str, filename: str,
     audio_copy: bool = True, chapters: list | None = None,
-    site: str = "youtube",
+    site: str = "youtube", info: dict | None = None,
 ) -> StreamingResponse:
     """Merge DASH video+audio into MKV, piped to client.
 
@@ -1914,10 +2312,14 @@ def _stream_merge(
                 with open(meta, "w") as mf:
                     mf.write(_ffmeta_chapters(chapters))
                 meta_args = ["-i", meta, "-map_metadata", "2", "-map_chapters", "2"]
+            # Workers skip re-extraction when they can (see _dump_info_json):
+            # the format IDs below come from this same info dict.
+            info_args = _dump_info_json(info, tmp)
+            src_args = [] if info_args else [url]
             try:
                 with _errfile("ffmpeg") as ef:
                     ff = await asyncio.create_subprocess_exec(
-                        "ffmpeg", "-hide_banner", "-loglevel", "error",
+                        _ffmpeg_bin() or "ffmpeg", "-hide_banner", "-loglevel", "error",
                         "-i", v_fifo, "-i", a_fifo, *meta_args,
                         "-map", "0:v:0", "-map", "1:a:0",
                         "-c:v", "copy", *acodec, *mux, "pipe:1",
@@ -1929,7 +2331,8 @@ def _stream_merge(
                     try:
                         with _errfile(tag) as ef:
                             w = await asyncio.create_subprocess_exec(
-                                "yt-dlp", *_common_flags(site), "-f", fmt_id, "-o", "-", url,
+                                *_ytdlp_cmd(), *_common_flags(site, url), *info_args,
+                                "-f", fmt_id, "-o", "-", *src_args,
                                 stdout=fd, stderr=ef,
                                 cwd=tmp,  # fragment temp files need writable cwd
                             )
@@ -1977,7 +2380,7 @@ def _clip_cmd(inputs: list[str], start: float, dur: float,
     """ffmpeg fetches direct URLs for clips: -ss before -i = fast keyframe
     seek server-side, only the slice is downloaded. Slower per-byte than the
     yt-dlp workers but clips are short — simplicity wins here."""
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+    cmd = [_ffmpeg_bin() or "ffmpeg", "-hide_banner", "-loglevel", "error"]
     if PROXY_URL:
         cmd += ["-http_proxy", PROXY_URL]
     for u in inputs:
@@ -2009,14 +2412,21 @@ def _range_proxy(direct_url: str, request: Request, filename: str,
         req_headers["Range"] = rng
     opener = _egress_opener()
 
+    # Bound concurrent upstream opens: the streaming semaphore gates the body
+    # relay, but this open happens before the response exists. Without a gate
+    # a batch can open unbounded sockets against a slow CDN first.
+    _FETCH_GATE.acquire()
     try:
-        r = opener.open(urllib.request.Request(_validate_egress(direct_url),
-                                               headers=req_headers), timeout=30)
-    except HTTPException:
-        raise  # egress rejection already carries its own status + reason
-    except Exception as e:
-        log.error("range proxy failed for %s…: %s", direct_url[:120], e)
-        raise HTTPException(502, f"upstream fetch failed: {e}") from e
+        try:
+            r = opener.open(urllib.request.Request(_validate_egress(direct_url),
+                                                   headers=req_headers), timeout=30)
+        except HTTPException:
+            raise  # egress rejection already carries its own status + reason
+        except Exception as e:
+            log.error("range proxy failed for %s…: %s", direct_url[:120], e)
+            raise HTTPException(502, f"upstream fetch failed: {e}") from e
+    finally:
+        _FETCH_GATE.release()
 
     status = getattr(r, "status", 200) or 200
     headers = {
@@ -2090,7 +2500,7 @@ def _sb_selector(kind: str, info: dict, codec: str = "") -> str:
 
 async def _file_download(url: str, selector: str, name: str, audio_only: bool,
                          sb: bool, turbo: bool, site: str = "youtube",
-                         est_bytes: int = 0) -> StreamingResponse:
+                         est_bytes: int = 0, info: dict | None = None) -> StreamingResponse:
     """Buffered download path for options that CAN'T stream:
       - turbo: aria2c opens many parallel connections (each gets its own
         YouTube throttle allowance) -> much faster single downloads, but
@@ -2149,7 +2559,12 @@ async def _file_download(url: str, selector: str, name: str, audio_only: bool,
 
     def _build_cmd(conns: int) -> list[str]:
         outtmpl = os.path.join(tmp, "out.%(ext)s")
-        c = ["yt-dlp", *_base_flags(site), "-f", selector, "-o", outtmpl]
+        # Skip re-extraction when the handler already has info (see
+        # _dump_info_json); the selector was built from this same dict.
+        info_args = _dump_info_json(info, tmp)
+        src_args = [] if info_args else [url]
+        c = _ytdlp_cmd() + [*_base_flags(site, url), *info_args, "-f", selector,
+             "-o", outtmpl]
         if turbo:
             # -x/-j scale with the shared budget; -s matches -x so a single
             # file is actually split that many ways. file-allocation=none
@@ -2250,7 +2665,7 @@ async def api_download(
     clip = start is not None and end is not None
     if clip and end <= start:
         raise HTTPException(400, "end must be after start")
-    if turbo and not shutil.which("aria2c"):
+    if turbo and not _resolve_bin("aria2c"):
         raise HTTPException(
             400, "Turbo needs aria2c. Install it (macOS: brew install aria2) "
             "or rebuild the Docker image, then retry.")
@@ -2284,6 +2699,7 @@ async def api_download(
         except Exception as e:
             raise _classify_error(e, site) from e
         name = _safe_name(info.get("title", "video"))
+    _check_duration(info)
     if clip:
         name += f"_clip_{int(start)}-{int(end)}"
         dur = end - start
@@ -2307,6 +2723,13 @@ async def api_download(
             # the interpreter would OOMKill the pod rather than degrade.
             # Raise it deliberately alongside the memory limit, not by default.
             budget = int(os.environ.get("ZIP_MAX_BYTES", str(64 * 1024 * 1024)))
+            # Per-image cap: the byte budget bounds the TOTAL, but a single
+            # pathological image (or a lying Content-Length) would otherwise be
+            # buffered whole before the total check trips. Stream in chunks and
+            # drop anything past this — a truncated JPEG in the zip is worse
+            # than an absent one.
+            single_cap = int(os.environ.get(
+                "ZIP_SINGLE_MAX_BYTES", str(32 * 1024 * 1024)))
             opener = _egress_opener()
             buf = io.BytesIO()
             # STORED (no compression): images are already compressed, and stored
@@ -2320,11 +2743,26 @@ async def api_download(
                         req = urllib.request.Request(
                             _validate_egress(p["url"]),
                             headers={"User-Agent": _OG_UA})
-                        # read one byte past the remaining budget so an
-                        # over-budget image is detected without buffering all
-                        # of it, then dropped whole (a truncated JPEG in the
-                        # zip is worse than an absent one)
-                        data = opener.open(req, timeout=30).read(budget - used + 1)
+                        # Chunked read with TWO ceilings: the remaining total
+                        # budget AND the per-image cap. Stops early instead of
+                        # buffering a giant image whole and then dropping it.
+                        limit = max(1, min(budget - used + 1, single_cap + 1))
+                        chunks: list[bytes] = []
+                        got_n = 0
+                        with opener.open(req, timeout=30) as resp:
+                            while True:
+                                piece = resp.read(min(1024 * 1024, limit - got_n))
+                                if not piece:
+                                    break
+                                chunks.append(piece)
+                                got_n += len(piece)
+                                if got_n >= limit:
+                                    break
+                        data = b"".join(chunks)
+                        if len(data) > single_cap:
+                            log.warning("zip photo %d exceeds single cap (%d bytes), skipping",
+                                        i, len(data))
+                            continue
                     except HTTPException as e:
                         log.error("zip photo %d rejected: %s", i, e.detail)
                         continue
@@ -2390,7 +2828,7 @@ async def api_download(
             return _range_proxy(best["url"], request, f"{name}_video{n}.mp4",
                                 "video/mp4", extra_headers=best.get("http_headers"))
         # HLS-only entry: let yt-dlp remux it (rare)
-        cmd = ["yt-dlp", *_common_flags(site), "--playlist-items", str(n),
+        cmd = _ytdlp_cmd() + [*_common_flags(site, url), "--playlist-items", str(n),
                "-f", "best", "-o", "-", url]
         return await _stream_proc(cmd, "video/mp4", f"{name}_video{n}.mp4")
 
@@ -2409,7 +2847,7 @@ async def api_download(
         audio_only = kind == "mp3" or kind.startswith("a:")
         return await _file_download(url, _sb_selector(kind, info, codec), name,
                                     audio_only, sb_remove, bool(turbo), site=site,
-                                    est_bytes=_estimate_bytes(info, kind))
+                                    est_bytes=_estimate_bytes(info, kind), info=info)
 
     # sb=mark: fold SponsorBlock segments in as CHAPTERS. Streaming path, no
     # scratch disk, no re-encode — the merge already emits a chapter block.
@@ -2431,7 +2869,7 @@ async def api_download(
             src = _best_prog_mp4(info)["url"]
         else:
             raise HTTPException(404, "no audio format")
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+        cmd = [_ffmpeg_bin() or "ffmpeg", "-hide_banner", "-loglevel", "error"]
         if PROXY_URL:
             cmd += ["-http_proxy", PROXY_URL]
         ss = ["-ss", f"{start:.3f}"] if clip else []
@@ -2479,7 +2917,7 @@ async def api_download(
             return await _stream_proc(cmd, "video/mp4", f"{name}.mp4")
         return _stream_merge(url, v["format_id"], a["format_id"],
                              f"{name}.mp4", audio_copy=audio_copy,
-                             chapters=chapters, site=site)
+                             chapters=chapters, site=site, info=info)
 
     if kind.startswith("m:"):  # DASH merge -> always MP4
         height = int(kind[2:])
@@ -2502,7 +2940,8 @@ async def api_download(
                                     ["-map", "0:v:0", "-map", "1:a:0"])
                     return await _stream_proc(cmd, "video/mp4", f"{name}.mp4")
                 return _stream_merge(url, v["format_id"], a["format_id"],
-                                     f"{name}.mp4", audio_copy=ac, chapters=chapters, site=site)
+                                     f"{name}.mp4", audio_copy=ac, chapters=chapters, site=site,
+                                     info=info)
         # QUALITY over codec: pick highest-bitrate video at this height no
         # matter the codec. YouTube's H.264 1080p is bitrate-starved and looks
         # visibly worse than VP9/AV1 at the same label — preferring avc1 for
@@ -2527,7 +2966,7 @@ async def api_download(
             return await _stream_proc(cmd, "video/mp4", f"{name}.mp4")
         return _stream_merge(url, v["format_id"], a["format_id"],
                              f"{name}.mp4", audio_copy=audio_copy,
-                             chapters=chapters, site=site)
+                             chapters=chapters, site=site, info=info)
 
     if kind.startswith("a:"):
         # pick the actual best audio so the file extension matches its codec

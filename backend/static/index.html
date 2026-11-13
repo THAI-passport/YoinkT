@@ -378,6 +378,14 @@ fetch("/api/health").then(r=>r.json()).then(h=>{
     $("ver").textContent += " · ⚠ no gallery-dl (photos off)";
     $("ver").title = "Install gallery-dl for X/IG/FB photo posts: pip install gallery-dl";
   }
+  if (h.engine && h.engine.stale) {  // pinned/old engine: most common "it worked yesterday"
+    $("ver").textContent += " · ⚠ engine " + (h.engine.version || "?") + " stale (" + (h.engine.age_days ?? "?") + "d)";
+    $("ver").title = "Extraction engine is past ENGINE_STALE_DAYS. Rebuild (Docker) or rerun run-local.sh to update yt-dlp.";
+  }
+  if (h.engine_auto_update && h.engine_auto_update.restart_needed) {  // update installed, restart applies it
+    $("ver").textContent += " · ⟳ restart to apply engine " + h.engine_auto_update.installed_version;
+    $("ver").title = "A newer engine was installed into the venv. Restart the server to use it.";
+  }
   const sel = document.createElement("select");
   sel.id = "pllanes";
   for (let i = 1; i <= serverMax; i++) {

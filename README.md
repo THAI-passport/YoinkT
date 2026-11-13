@@ -133,12 +133,17 @@ Priority is static token (`PO_TOKEN`) > HTTP server (`POT_PROVIDER_URL`, needs D
 | `ENABLED_SITES` | `youtube,x,facebook,instagram,tiktok` | Supported sites |
 | `API_KEY` | unset | If set, requires `?key=` or `X-API-Key` on `/api` routes |
 | `RATE_LIMIT_RPM` | `0` | Per-IP requests/min (Abuse guard for public deployments) |
-| `MAX_CONCURRENCY` | `4` | Simultaneous extractions/streams per instance |
+| `MAX_CONCURRENCY` | `6` | Simultaneous extractions/streams per instance |
+| `MAX_DURATION_SECS` | `0` | Refuse videos longer than this (0 = no cap; e.g. `14400` for public boxes) |
+| `ZIP_MAX_BYTES` | `67108864` | Carousel-zip total byte budget (RAM) |
+| `ZIP_SINGLE_MAX_BYTES` | `33554432` | Per-image cap inside the zip (skipped, not truncated) |
 
 ## 🛠 Frontend Development
 
-The default UI is a hand-bundled vanilla JS file located at `backend/static/index.html`. 
-There is also a React + TypeScript version in `frontend/`. To build and replace the vanilla UI:
+The default UI is the hand-bundled vanilla JS file at `backend/static/index.html`
+(it is the only UI wired to `/api/health`, `media[]`, error hints, lanes).
+`frontend/` is a stale React prototype (YouTube-only, no `media[]`/`meta`) kept
+for reference — do not build from it unless you plan to bring it up to parity.
 
 ```bash
 cd frontend

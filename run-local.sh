@@ -45,7 +45,24 @@ if [ "$MODE" = docker ]; then
   docker compose build --no-cache
   docker compose up -d
 else
-  command -v ffmpeg >/dev/null || { echo "FAIL: ffmpeg missing. macOS: brew install ffmpeg"; exit 1; }
+  # ffmpeg must not just EXIST on PATH — it must WORK. A stub script named
+  # `ffmpeg` earlier in PATH (e.g. ~/.local/bin) once shadowed the real brew
+  # build and every merge came back as a silent 0-byte download.
+  if command -v ffmpeg >/dev/null && ffmpeg -version 2>/dev/null | grep -q "^ffmpeg version"; then
+    echo "ffmpeg OK ($(command -v ffmpeg))"
+  else
+    FOUND=""
+    for cand in /opt/homebrew/bin/ffmpeg /usr/local/bin/ffmpeg; do
+      [ -x "$cand" ] && "$cand" -version 2>/dev/null | head -1 | grep -q "^ffmpeg version" && { FOUND="$cand"; break; }
+    done
+    if [ -n "$FOUND" ]; then
+      echo "WARN: PATH ffmpeg is broken or a stub — but $FOUND works."
+      echo "      The app falls back to it automatically, but fix your PATH, e.g.:"
+      echo "      mv ~/.local/bin/ffmpeg ~/.local/bin/ffmpeg.dummy.bak"
+    else
+      echo "FAIL: no working ffmpeg found. macOS: brew install ffmpeg"; exit 1
+    fi
+  fi
   command -v aria2c >/dev/null || echo "note: aria2c not found — ⚡ Turbo mode will be disabled (brew install aria2 to enable)."
   command -v deno >/dev/null || command -v node >/dev/null || echo "note: no JS runtime (deno/node) — YouTube may throttle to ~50 KB/s (brew install deno to fix)."
   # PO-token provider = the main anti-throttle lever (full-speed googlevideo

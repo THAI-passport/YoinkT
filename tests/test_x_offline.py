@@ -362,7 +362,7 @@ check("gdl config flag is list", isinstance(app._gdl_config_flag(), list))
 check("gdl config flag empty or known",
       app._gdl_config_flag() in ([], ["--ignore-config"], ["--config-ignore"]))
 
-check("version v46", "v46" in app.APP_VERSION and "always-mp4" in app.APP_VERSION)
+check("version v52", "v52" in app.APP_VERSION and "always-mp4" in app.APP_VERSION)
 
 
 # ---- v39: engine pin must not drift across the four places it appears ----
@@ -855,23 +855,46 @@ for _m in ["nsig extraction failed", "Sign in to confirm you're not a bot",
 # ---- v45: cookie-free / PO-token-free YouTube via token-free player clients ----
 _sv_ck, _sv_sc, _sv_rt, _sv_pot = (app.COOKIES_FILE, dict(app.SITE_COOKIES),
                                    dict(app.SITE_COOKIES_RUNTIME), app._POT_ON)
+# _pot_mode() does NOT read _POT_ON — it re-derives from these three, so a dev
+# machine with the bgutil provider installed would keep pot "on" and silently
+# skip every token-free-client check below. Neutralize all of them.
+_sv_potmode = (app.PO_TOKEN, app.POT_PROVIDER_URL, app.POT_SCRIPT_HOME)
 app.COOKIES_FILE = None
+app.PO_TOKEN = None
+app.POT_PROVIDER_URL = None
+app.POT_SCRIPT_HOME = ""
+app._pot_script_ready.cache_clear()  # lru_cache: an earlier probe would stick
 app.SITE_COOKIES = {k: None for k in app.SITE_COOKIES}
 app.SITE_COOKIES_RUNTIME = {}
 app._POT_ON = False
 
-# degraded state (no cookies, no PO token): token-free clients kick in
+# web-first (v51): fresh URLs always try `web`; fallback is a per-URL retry.
+# _yt_fallback_clients(url) is [] for a fresh URL even in the degraded state —
+# it only returns the list once the URL has proved bot-walled.
 _cl = app._yt_fallback_clients("youtube")
-check("degraded state uses token-free clients", _cl == ["tv", "ios", "mweb"])
+check("degraded state configures token-free clients", _cl == ["tv", "ios", "mweb"])
 check("fallback is youtube-only", app._yt_fallback_clients("x") == [])
-check("extract path carries the clients",
-      app._ydl_opts("youtube")["extractor_args"]["youtube"]["player_client"] == _cl)
-check("download path carries the SAME clients (no split-brain)",
-      any("player_client=tv,ios,mweb" in f for f in app._base_flags("youtube")))
-check("extract and download clients agree",
-      app._ydl_opts("youtube")["extractor_args"]["youtube"]["player_client"]
-      == [c for f in app._base_flags("youtube") if "player_client=" in f
+check("fresh URL uses web (no forced clients in extract)",
+      "player_client" not in (app._ydl_opts("youtube").get("extractor_args", {}).get("youtube", {})))
+check("fresh URL uses web (no forced clients in download)",
+      not any("player_client" in f for f in app._base_flags("youtube")))
+check("extract and download agree (both web for fresh URL)",
+      ("player_client" in (app._ydl_opts("youtube").get("extractor_args", {}).get("youtube", {})))
+      == any("player_client" in f for f in app._base_flags("youtube")))
+# a URL that proved bot-walled gets the fallback on BOTH paths (no split-brain)
+_walled = "https://www.youtube.com/watch?v=WALLED1234siXYZ"
+app._YT_FALLBACK_NEEDED.add(app._canonical_url(_walled))
+check("walled URL extract carries the fallback clients",
+      app._ydl_opts("youtube", _walled)["extractor_args"]["youtube"]["player_client"] == _cl)
+check("walled URL download carries the SAME clients (no split-brain)",
+      any("player_client=tv,ios,mweb" in f for f in app._base_flags("youtube", _walled)))
+check("extract and download clients agree for walled URL",
+      app._ydl_opts("youtube", _walled)["extractor_args"]["youtube"]["player_client"]
+      == [c for f in app._base_flags("youtube", _walled) if "player_client=" in f
           for c in f.split("player_client=")[1].split(",")])
+check("tracking params don't dodge the walled set",
+      app._ydl_opts("youtube", _walled + "&si=NOISE")["extractor_args"]["youtube"]["player_client"] == _cl)
+app._YT_FALLBACK_NEEDED.clear()
 
 # a PO token restores the full-speed web client on BOTH paths
 _sv_tok = app.PO_TOKEN
@@ -899,6 +922,7 @@ check("health reports the active yt clients",
 
 app.COOKIES_FILE, app.SITE_COOKIES, app.SITE_COOKIES_RUNTIME, app._POT_ON = (
     _sv_ck, _sv_sc, _sv_rt, _sv_pot)
+app.PO_TOKEN, app.POT_PROVIDER_URL, app.POT_SCRIPT_HOME = _sv_potmode
 
 
 # ---- v46: bgutil script-mode PO tokens (no server, no Docker, no cookies) ----
@@ -950,6 +974,134 @@ check("http mode emits bgutilhttp not script",
 (app.PO_TOKEN, app.POT_PROVIDER_URL, app.POT_SCRIPT_HOME, app.shutil.which,
  app.COOKIES_FILE, app.SITE_COOKIES, app.SITE_COOKIES_RUNTIME) = _sv
 app._pot_script_ready.cache_clear()
+
+
+# ---- v47: cookies skip PO token gen (fixes the merge hang) ----
+# Root cause found live: with cookies present, the merge's two workers still
+# carried the bgutilscript PO arg, and concurrent script-mode token generation
+# HUNG the download (0 bytes / 6 min). Plain cookied yt-dlp downloads fine with
+# no PO token, so cookies must suppress PO entirely.
+_sv47 = (app.PO_TOKEN, app.POT_PROVIDER_URL, app.POT_SCRIPT_HOME, app.shutil.which,
+         app.COOKIES_FILE, dict(app.SITE_COOKIES), dict(app.SITE_COOKIES_RUNTIME))
+app.PO_TOKEN = None; app.POT_PROVIDER_URL = None
+app.POT_SCRIPT_HOME = "/tmp/potsrv47"
+_os2 = __import__("os")
+_os2.makedirs("/tmp/potsrv47/src", exist_ok=True)
+_os2.makedirs("/tmp/potsrv47/node_modules", exist_ok=True)
+open("/tmp/potsrv47/src/generate_once.ts", "w").close()
+app.shutil.which = lambda n: "/usr/bin/deno" if n == "deno" else None
+app.COOKIES_FILE = None
+app.SITE_COOKIES = {k: None for k in app.SITE_COOKIES}
+app.SITE_COOKIES_RUNTIME = {}
+app._pot_script_ready.cache_clear()
+
+# no cookies: PO is wanted, script arg present on both paths (full-res no-cookie)
+check("no cookies -> PO wanted", app._pot_wanted() is True)
+check("no cookies -> extract has bgutilscript",
+      "youtubepot-bgutilscript" in app._extractor_args_dict())
+check("no cookies -> merge worker has bgutilscript",
+      any("bgutilscript" in f for f in app._base_flags("youtube")))
+
+# cookies present: PO SKIPPED -> fetch_pot=never, no bgutil arg (the fix)
+app.SITE_COOKIES = {**app.SITE_COOKIES, "youtube": "/tmp/yt.txt"}
+check("cookies -> PO NOT wanted", app._pot_wanted() is False)
+check("cookies -> no bgutil arg in extract dict",
+      "youtubepot-bgutilscript" not in app._extractor_args_dict()
+      and "youtubepot-bgutilhttp" not in app._extractor_args_dict())
+check("cookies -> extract tells engine fetch_pot=never",
+      app._extractor_args_dict().get("youtube", {}).get("fetch_pot") == ["never"])
+check("cookies -> merge worker has NO PO gen (no hang)",
+      not any("bgutil" in f for f in app._base_flags("youtube"))
+      and any("fetch_pot=never" in f for f in app._base_flags("youtube")))
+# health still reports the provider is CONFIGURED (script), just not applied now
+check("pot_mode still reports script (configured)", app._pot_mode() == "script")
+
+(app.PO_TOKEN, app.POT_PROVIDER_URL, app.POT_SCRIPT_HOME, app.shutil.which,
+ app.COOKIES_FILE, app.SITE_COOKIES, app.SITE_COOKIES_RUNTIME) = _sv47
+app._pot_script_ready.cache_clear()
+
+
+# ---- v48/v49: binary guard + engine auto-update ----
+check("version v52", "v52" in app.APP_VERSION and "always-mp4" in app.APP_VERSION)
+# stub detection: `echo` exits 0 but never answers like the real tool
+check("stub ffmpeg rejected", not app._bin_works("ffmpeg", "/bin/echo"))
+check("stub yt-dlp rejected", not app._bin_works("yt-dlp", "/bin/echo"))
+check("missing binary rejected", not app._bin_works("aria2c", "/nonexistent/x"))
+# real venv engine (when present) validates — this is what _ytdlp_cmd prefers
+_real = os.path.join(os.path.dirname(app.sys.executable), "yt-dlp")
+if os.path.isfile(_real):
+    check("venv yt-dlp validates", app._bin_works("yt-dlp", _real))
+check("yt-dlp argv prefix always has one element",
+      len(app._ytdlp_cmd()) == 1 and isinstance(app._ytdlp_cmd()[0], str))
+app._resolve_bin("ffmpeg"); app._resolve_bin("yt-dlp")  # populate the cache
+check("resolver caches per name with TTL",
+      "ffmpeg" in app._bin_cache and "yt-dlp" in app._bin_cache)
+check("health reports guarded binaries",
+      all(s in __import__("inspect").getsource(app.health)
+          for s in ("binaries", "engine_auto_update")))
+check("auto-update loop gated by env flag",
+      "ENGINE_AUTO_UPDATE" in __import__("inspect").getsource(app._engine_update_loop))
+
+
+# ---- v50: local-hardening (canonical keys, bundle lock fix, caps) ----
+check("canonical strips si tracking",
+      app._canonical_url("https://www.youtube.com/watch?v=abc123&si=XYZ")
+      == app._canonical_url("https://www.youtube.com/watch?v=abc123"))
+check("canonical strips utm/fbclid",
+      app._canonical_url("https://x.com/u/status/1?utm_source=x&fbclid=Z")
+      == app._canonical_url("https://x.com/u/status/1"))
+check("canonical lowercases host",
+      app._canonical_url("https://WWW.YOUTUBE.COM/watch?v=abc123")
+      == app._canonical_url("https://www.youtube.com/watch?v=abc123"))
+check("canonical keeps video id",
+      "abc123" in app._canonical_url("https://www.youtube.com/watch?v=abc123&si=XYZ"))
+check("bundle locks have refcount discipline",
+      hasattr(app, "_x_lock_users") and isinstance(app._x_lock_users, dict))
+check("bundle cached uses canonical key",
+      "_canonical_url" in __import__("inspect").getsource(app._bundle_cached))
+check("extract cached uses canonical key",
+      "_canonical_url" in __import__("inspect").getsource(app._extract_cached))
+check("fetch gate exists and bounds opens",
+      hasattr(app, "_FETCH_GATE"))
+check("range proxy gated",
+      "_FETCH_GATE" in __import__("inspect").getsource(app._range_proxy))
+check("subs gated by sem",
+      "async with sem" in __import__("inspect").getsource(app.api_subs))
+check("zip has per-image cap",
+      "ZIP_SINGLE_MAX_BYTES" in __import__("inspect").getsource(app.api_download))
+check("duration guard helper exists",
+      hasattr(app, "_check_duration") and hasattr(app, "MAX_DURATION_SECS"))
+check("download enforces duration cap",
+      "_check_duration" in __import__("inspect").getsource(app.api_download))
+check("health reports restart_needed",
+      "restart_needed" in __import__("inspect").getsource(app.health))
+check("health reports local limits",
+      '"limits"' in __import__("inspect").getsource(app.health)
+      or "'limits'" in __import__("inspect").getsource(app.health))
+
+
+# ---- v52: workers skip re-extraction via --load-info-json ----
+import tempfile as _tf
+_d = _tf.mkdtemp()
+try:
+    args = app._dump_info_json({"id": "x", "formats": []}, _d)
+    check("dump returns load-info-json argv", args == ["--load-info-json", _d + "/info.json"])
+    import json as _js
+    check("dumped info is valid JSON",
+          _js.load(open(_d + "/info.json"))["id"] == "x")
+    check("no info -> no args (URL extraction fallback)",
+          app._dump_info_json(None, _d) == [])
+finally:
+    import shutil as _sh
+    _sh.rmtree(_d, ignore_errors=True)
+check("merge workers take load-info-json when info present",
+      "info_args" in __import__("inspect").getsource(app._stream_merge)
+      and "load-info-json" in __import__("inspect").getsource(app._dump_info_json))
+check("buffered path takes load-info-json when info present",
+      "info_args" in __import__("inspect").getsource(app._file_download)
+      and "load-info-json" in __import__("inspect").getsource(app._dump_info_json))
+check("download hands cached info to merge path",
+      "info=info" in __import__("inspect").getsource(app.api_download))
 
 print(f"\nTOTAL {ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)
